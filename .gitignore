@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+cookies.txt
+tmp/
+Apple Music/
