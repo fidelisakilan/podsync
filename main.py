@@ -27,6 +27,21 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Input, Label, ListItem, ListView, Log, Static
 
+
+class ReadOnlyLog(Log):
+    ALLOW_FOCUS = False
+
+    def on_click(self, event) -> None:
+        event.stop()
+        self.app.query_one("#album-list", ListView).focus()
+
+    def scroll_up(self, *args, **kwargs) -> None: pass
+    def scroll_page_up(self, *args, **kwargs) -> None: pass
+    def scroll_home(self, *args, **kwargs) -> None: pass
+
+    def on_mouse_scroll_up(self, event) -> None:
+        event.stop()
+
 from gamdl.api import AppleMusicApi, ItunesApi
 from gamdl.downloader import (
     AppleMusicBaseDownloader,
@@ -115,10 +130,8 @@ class DownloaderApp(App):
 
     ListView { scrollbar-size-vertical: 1; scrollbar-color: $panel $background; }
     Log {
-        scrollbar-size-vertical: 1;
-        scrollbar-size-horizontal: 0;
-        scrollbar-color: $panel $background;
         overflow-x: hidden;
+        scrollbar-size-vertical: 0;
     }
     """
 
@@ -127,6 +140,7 @@ class DownloaderApp(App):
         Binding("a",       "toggle_all",   "Toggle All",   show=True),
         Binding("d",       "download",     "Download",     show=True),
         Binding("x",       "stop",         "Stop",         show=True),
+        Binding("s",       "sort",         "Sort",         show=True),
         Binding("j",       "cursor_down",  "Down",         show=False),
         Binding("k",       "cursor_up",    "Up",           show=False),
         Binding("g",       "g_key",        "gg=Top",       show=False),
@@ -152,6 +166,7 @@ class DownloaderApp(App):
         self._busy = False
         self._stop = False
         self._queue: list[dict] = []
+        self._sort_key = "album"   # "album" | "artist"
         self._g_pressed = False
 
     # ── layout ────────────────────────────────────────────────────────────────
@@ -160,7 +175,7 @@ class DownloaderApp(App):
         with Horizontal(id="body"):
             with Vertical(id="left"):
                 yield ListView(id="album-list")
-            yield Log(id="log", auto_scroll=True)
+            yield ReadOnlyLog(id="log", auto_scroll=True)
         with Horizontal(id="search-row"):
             yield Input(placeholder="/ to search…", id="search")
             yield Label("", id="counter")
@@ -176,7 +191,7 @@ class DownloaderApp(App):
 
     @work(thread=False)
     async def _init(self) -> None:
-        log = self.query_one("#log", Log)
+        log = self.query_one("#log", ReadOnlyLog)
         cookies = Path(self.cookies_path)
         if not cookies.exists():
             log.write_line(f"cookies.txt not found: {cookies}")
@@ -216,15 +231,29 @@ class DownloaderApp(App):
 
     def _apply_filter(self, q: str) -> None:
         q = q.strip().lower()
-        self._visible = [
-            a["id"] for a in self._all
+        filtered = [
+            a for a in self._all
             if not q
             or q in a.get("attributes", {}).get("name", "").lower()
             or q in a.get("attributes", {}).get("artistName", "").lower()
         ]
+        if self._sort_key == "artist":
+            filtered.sort(key=lambda a: (
+                a.get("attributes", {}).get("artistName", "").lower(),
+                a.get("attributes", {}).get("name", "").lower(),
+            ))
+        else:
+            filtered.sort(key=lambda a: a.get("attributes", {}).get("name", "").lower())
+        self._visible = [a["id"] for a in filtered]
         self._rebuild_list()
         shown, total = len(self._visible), len(self._all)
         self.query_one("#counter", Label).update(f"{shown}/{total}" if q else f"{total}")
+
+    def action_sort(self) -> None:
+        self._sort_key = "artist" if self._sort_key == "album" else "album"
+        q = self.query_one("#search", Input).value
+        self._apply_filter(q)
+        self.query_one("#log", ReadOnlyLog).write_line(f"Sorted by {self._sort_key}.")
 
     # ── list ──────────────────────────────────────────────────────────────────
 
@@ -245,6 +274,7 @@ class DownloaderApp(App):
             if aid in self._selected:
                 item.add_class("selected")
             lv.append(item)
+        lv.scroll_home(animate=False)
 
     def _refresh_tile(self, aid: str) -> None:
         try:
@@ -329,29 +359,29 @@ class DownloaderApp(App):
         if self._busy:
             self._stop = True
             self._queue.clear()
-            self.query_one("#log", Log).write_line("⏹ stopping after current track…")
+            self.query_one("#log", ReadOnlyLog).write_line("⏹ stopping after current track…")
         else:
-            self.query_one("#log", Log).write_line("Nothing is downloading.")
+            self.query_one("#log", ReadOnlyLog).write_line("Nothing is downloading.")
 
     def action_download(self) -> None:
         if not self._selected:
             lv = self._lv()
             idx = lv.index
             if idx is None or idx >= len(self._visible):
-                self.query_one("#log", Log).write_line("No album selected.")
+                self.query_one("#log", ReadOnlyLog).write_line("No album selected.")
                 return
             albums = [self._map[self._visible[idx]]]
         else:
             albums = [self._map[i] for i in self._selected if i in self._map]
         if not self._dl:
-            self.query_one("#log", Log).write_line("Not ready yet.")
+            self.query_one("#log", ReadOnlyLog).write_line("Not ready yet.")
             return
         for aid in list(self._selected):
             self._selected.discard(aid)
             self._refresh_tile(aid)
         if self._busy:
             self._queue.extend(albums)
-            self.query_one("#log", Log).write_line(f"Queued {len(albums)} album(s)  —  {len(self._queue)} in queue")
+            self.query_one("#log", ReadOnlyLog).write_line(f"Queued {len(albums)} album(s)  —  {len(self._queue)} in queue")
             return
         self._busy = True
         self._stop = False
@@ -359,7 +389,7 @@ class DownloaderApp(App):
 
     @work(thread=False)
     async def _download(self, albums: list[dict]) -> None:
-        log = self.query_one("#log", Log)
+        log = self.query_one("#log", ReadOnlyLog)
         pending = list(albums)
 
         while pending:
@@ -395,14 +425,15 @@ class DownloaderApp(App):
                     fail += 1
                     continue
 
-                for item in items:
+                total_tracks = len(items)
+                for tidx, item in enumerate(items, 1):
                     track = item.media_metadata.get("attributes", {}).get("name", "?") if item.media_metadata else "?"
                     try:
                         await self._dl.download(item)
-                        log.write_line(f"  ✓ {track}")
+                        log.write_line(f"  ✓ [{tidx}/{total_tracks}] {track}")
                         ok += 1
                     except Exception as e:
-                        log.write_line(f"  ✗ {track}: {e}")
+                        log.write_line(f"  ✗ [{tidx}/{total_tracks}] {track}: {e}")
                         fail += 1
 
             log.write_line(f"finished: {ok} downloaded, {fail} skipped")
