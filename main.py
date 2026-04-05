@@ -10,7 +10,9 @@ Usage:
 """
 
 import configparser
+import json
 import re
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -18,7 +20,56 @@ from urllib.parse import parse_qs, urlparse
 def _gamdl_output_path() -> str:
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(Path.home() / ".gamdl" / "config.ini")
-    return cfg.get("gamdl", "output_path", fallback="./Apple Music")
+    raw = cfg.get("gamdl", "output_path", fallback="./Apple Music")
+    return str(Path(raw).expanduser().resolve())
+
+
+def _sanitize(s: str) -> str:
+    """Mirror gamdl's path sanitization (ILLEGAL_CHARS_RE → '_')."""
+    return re.sub(r'[\\/:*?"<>|;]', "_", s).strip()
+
+
+def _album_complete(output_path: str, artist: str, album: str, track_count: int) -> bool:
+    """Return True if the album folder already contains enough audio files."""
+    base = Path(output_path)
+    candidates = [
+        base / _sanitize(artist) / _sanitize(album),
+        base / "Compilations" / _sanitize(album),
+    ]
+    for folder in candidates:
+        if folder.is_dir():
+            audio = [f for f in folder.iterdir() if f.suffix in (".m4a", ".mp4")]
+            if len(audio) >= track_count:
+                return True
+    return False
+
+
+CACHE_PATH = Path.home() / ".apple-music-manager" / "cache.json"
+
+
+def _load_cache() -> dict:
+    if CACHE_PATH.exists():
+        try:
+            return json.loads(CACHE_PATH.read_text())
+        except Exception:
+            pass
+    return {"version": 1, "albums": {}}
+
+
+def _save_cache(cache: dict) -> None:
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, indent=2))
+    tmp.replace(CACHE_PATH)
+
+
+def _cache_album(cache: dict, album_id: str, artist: str, album: str) -> None:
+    cache["albums"][album_id] = {
+        "completed_at": datetime.now().isoformat(),
+        "artist": artist,
+        "album": album,
+    }
+    _save_cache(cache)
 
 import click
 from textual import on, work
@@ -390,9 +441,32 @@ class DownloaderApp(App):
     @work(thread=False)
     async def _download(self, albums: list[dict]) -> None:
         log = self.query_one("#log", ReadOnlyLog)
+        cache = _load_cache()
         pending = list(albums)
 
         while pending:
+            if not self.overwrite:
+                need = []
+                for entry in pending:
+                    aid   = entry["id"]
+                    attrs = entry.get("attributes", {})
+                    if aid in cache["albums"] or _album_complete(
+                        self.output_path,
+                        attrs.get("artistName", "?"),
+                        attrs.get("name", "?"),
+                        attrs.get("trackCount", 0),
+                    ):
+                        continue
+                    need.append(entry)
+                skipped = len(pending) - len(need)
+                if skipped:
+                    log.write_line(f"⏭ skipped {skipped} already-downloaded album(s)")
+                pending = need
+
+            if not pending:
+                log.write_line("nothing to download.")
+                break
+
             ok = fail = 0
             for idx, entry in enumerate(pending, 1):
                 if self._stop:
@@ -401,9 +475,11 @@ class DownloaderApp(App):
                     self._queue.clear()
                     self._busy = False
                     return
-                aid   = entry["id"]
-                attrs = entry.get("attributes", {})
-                title = f"{attrs.get('artistName','?')} — {attrs.get('name','?')}"
+                aid    = entry["id"]
+                attrs  = entry.get("attributes", {})
+                artist = attrs.get("artistName", "?")
+                name   = attrs.get("name", "?")
+                title  = f"{artist} — {name}"
                 log.write_line(f"▶ [{idx}/{len(pending)}] {title}")
 
                 try:
@@ -428,6 +504,10 @@ class DownloaderApp(App):
                 total_tracks = len(items)
                 for tidx, item in enumerate(items, 1):
                     track = item.media_metadata.get("attributes", {}).get("name", "?") if item.media_metadata else "?"
+                    if not self.overwrite and item.final_path and Path(item.final_path).exists():
+                        log.write_line(f"  ✓ [{tidx}/{total_tracks}] {track} (exists)")
+                        ok += 1
+                        continue
                     try:
                         await self._dl.download(item)
                         log.write_line(f"  ✓ [{tidx}/{total_tracks}] {track}")
@@ -435,6 +515,8 @@ class DownloaderApp(App):
                     except Exception as e:
                         log.write_line(f"  ✗ [{tidx}/{total_tracks}] {track}: {e}")
                         fail += 1
+
+                _cache_album(cache, aid, artist, name)
 
             log.write_line(f"finished: {ok} downloaded, {fail} skipped")
 
