@@ -240,6 +240,7 @@ class LogModal(ModalScreen):
     BINDINGS = [
         Binding("escape", "dismiss", "Close"),
         Binding("/",      "dismiss", "Close"),
+        Binding("q",      "dismiss", "Close"),
     ]
 
     def __init__(self, lines: list[str]) -> None:
@@ -307,9 +308,23 @@ class IpodSyncApp(App):
         background: $background;
     }
 
-    ListView > ListItem.--highlight {
-        background: $accent 25%;
-        border-left: solid $accent;
+    /* cursor only visible when pane is focused — identical style for both panes */
+    ListView > ListItem.-highlight {
+        background: transparent;
+        border-left: none;
+        text-style: none;
+        color: $text;
+    }
+
+    ListView:focus > ListItem.-highlight {
+        background: $primary 20%;
+        text-style: none;
+        color: $text;
+    }
+
+    ListView:focus > ListItem.-highlight > Static {
+        background: transparent;
+        color: $text;
     }
 
     #track-table {
@@ -319,35 +334,58 @@ class IpodSyncApp(App):
         background: $background;
     }
 
-    DataTable > .datatable--cursor {
-        background: $accent 25%;
-    }
-
-    /* ── progress bar (bottom, full-width, slim) ── */
-    #progress-area {
-        width: 100%;
-        height: 3;
-        layout: horizontal;
-        align: left middle;
-        padding: 0 2;
-        border-top: solid $panel;
-        background: $background;
-    }
-
-    #phase-label {
-        width: 30;
-        text-style: bold;
+    DataTable .datatable--cursor {
+        background: transparent;
         color: $text;
     }
 
-    #progress-bar { width: 1fr; }
+    DataTable:focus .datatable--cursor {
+        background: $primary 20%;
+        color: $text;
+        border-left: solid $primary;
+    }
+
+    /* ── bottom bar ── */
+    #bottom-bar {
+        width: 100%;
+        height: 3;
+        border-top: solid $panel;
+        background: $background;
+        layout: horizontal;
+        align: left middle;
+        padding: 0 2;
+    }
+
+    #phase-label {
+        width: auto;
+        text-style: bold;
+        color: $text;
+        padding: 0 1 0 0;
+    }
 
     #progress-count {
-        width: 16;
-        text-align: right;
+        width: auto;
+        color: $text-muted;
+        padding: 0 1;
+    }
+
+    #progress-bar { width: 25; height: 1; min-width: 0; }
+
+    #progress-pct {
+        width: 5;
         color: $text-muted;
         padding: 0 0 0 1;
     }
+
+    #bar-spacer { width: 1fr; }
+
+    #ipod-status {
+        width: 26;
+        text-align: right;
+        color: $text-muted;
+    }
+
+    #ipod-status.ipod-connected { color: $success; }
 
     Footer { background: $background; color: $text-muted; }
 
@@ -412,17 +450,20 @@ class IpodSyncApp(App):
             with Vertical(id="right"):
                 yield Label("Tracks / Albums", id="right-header")
                 yield DataTable(id="track-table", show_header=False, cursor_type="row")
-        with Horizontal(id="progress-area"):
+        with Horizontal(id="bottom-bar"):
             yield Label("Starting…", id="phase-label")
+            yield Label("", id="progress-count")
             yield ProgressBar(
                 id="progress-bar", total=100,
                 show_eta=False, show_percentage=False,
             )
-            yield Label("", id="progress-count")
+            yield Label("", id="progress-pct")
+            yield Static("", id="bar-spacer")
+            yield Label("○ iPod", id="ipod-status")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.theme     = "tokyo-night"
+        self.theme = "catppuccin-mocha"
         self.sub_title = "iPod: not connected"
         self.query_one("#playlist-list", ListView).focus()
         self._init()
@@ -445,14 +486,16 @@ class IpodSyncApp(App):
                 pass
         try:
             pb  = self.query_one("#progress-bar", ProgressBar)
-            lbl = self.query_one("#progress-count", Label)
+            cnt = self.query_one("#progress-count", Label)
+            pct = self.query_one("#progress-pct", Label)
             if total > 0:
                 pb.update(total=total, progress=current)
-                pct = current * 100 // total
-                lbl.update(f"{current}/{total}  {pct}%")
+                cnt.update(f"{current}/{total}")
+                pct.update(f"{current * 100 // total}%")
             else:
                 pb.update(total=None)
-                lbl.update(f"{current}" if current else "")
+                cnt.update(f"{current}" if current else "")
+                pct.update("")
         except Exception:
             pass
 
@@ -619,15 +662,23 @@ class IpodSyncApp(App):
         mount = _find_ipod_mount()
         if mount != self._ipod_mount:
             self._ipod_mount = mount
+            try:
+                lbl = self.query_one("#ipod-status", Label)
+                if mount:
+                    try:
+                        st = os.statvfs(mount)
+                        used_gb  = (st.f_blocks - st.f_bavail) * st.f_frsize / 1e9
+                        total_gb = st.f_blocks * st.f_frsize / 1e9
+                        lbl.update(f"● iPod  {used_gb:.1f}/{total_gb:.1f} GB")
+                    except OSError:
+                        lbl.update("● iPod")
+                    lbl.add_class("ipod-connected")
+                else:
+                    lbl.update("○ iPod")
+                    lbl.remove_class("ipod-connected")
+            except Exception:
+                pass
             if mount:
-                try:
-                    st = os.statvfs(mount)
-                    free_gb  = st.f_bavail * st.f_frsize / 1e9
-                    total_gb = st.f_blocks * st.f_frsize / 1e9
-                    name = Path(mount).name
-                    self.sub_title = f"iPod: {name}  {free_gb:.1f}/{total_gb:.1f} GB free"
-                except OSError:
-                    self.sub_title = f"iPod: {Path(mount).name}"
                 self._log(f"iPod connected at {mount}")
             else:
                 self.sub_title = "iPod: not connected"
