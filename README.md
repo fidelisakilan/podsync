@@ -9,43 +9,41 @@ Downloads all albums and playlists from your Apple Music account and copies them
 ![Library view](screenshots/library.png)
 ![Playlist view](screenshots/playlist.png)
 
-## System dependencies
+## Setup
 
-Install these with pacman before running:
+1. Clone the repository
+
+```
+git clone https://github.com/youruser/podsync
+cd podsync
+```
+
+2. Install system dependencies (Arch Linux)
 
 ```
 sudo pacman -S libgpod ffmpeg
-```
-
-You also need `mp4decrypt` from the Widevine toolchain. Install it via AUR:
-
-```
 yay -S widevine-aur
 ```
 
-Or place the `mp4decrypt` binary somewhere in your PATH manually.
-
-## Python dependencies
-
-Requires Python 3.13 and [uv](https://github.com/astral-sh/uv).
+3. Install Python dependencies (requires Python 3.13 and [uv](https://github.com/astral-sh/uv))
 
 ```
 uv sync
 ```
 
-This installs all Python dependencies including `gamdl`, `textual`, `mutagen`, and `cffi`. The libgpod C extension is compiled automatically on first run.
+4. Get your Apple Music cookies. Install the [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) Chrome extension, open music.apple.com while signed in, and export cookies in Netscape format.
 
-## Setup
+5. Place the exported file as `cookies.txt` in the project folder, or pass its path via `--cookies`.
 
-Export your Apple Music cookies from a browser session on music.apple.com using a browser extension that exports in Netscape format. Save the file as `cookies.txt` in the project directory.
+6. Mount your iPod by opening your file manager (Nautilus, Thunar, etc.) and clicking the iPod in the sidebar.
 
-## Running
+7. Run the app
 
 ```
 uv run python ipod_sync.py
 ```
 
-Options:
+## Options
 
 ```
 --cookies PATH    Path to cookies.txt (default: ./cookies.txt)
@@ -54,7 +52,9 @@ Options:
 
 ## Usage
 
-The app loads your full library on startup. Navigation:
+The app loads your full library on startup. Press `s` to start a sync. The app downloads any missing albums, then copies new tracks to the iPod and recreates your playlists on the device.
+
+Navigation:
 
 | Key | Action |
 |-----|--------|
@@ -70,14 +70,31 @@ The app loads your full library on startup. Navigation:
 | / | Open log viewer |
 | q | Quit |
 
-Before pressing `s` to sync, make sure your iPod is mounted. Open your file manager (Nautilus, Thunar, etc.), find the iPod in the sidebar, and click it to mount it. The bottom right of the app will show the device name and storage once it is detected.
-
-Press `s` to start a sync. The app first downloads any missing albums from Apple Music, then copies new tracks to the iPod and syncs playlists.
-
-The iPod connection status and storage usage are shown in the bottom right of the screen.
+The iPod connection status and storage usage are shown in the bottom right. The device must be mounted before starting a sync.
 
 ## Notes
 
 Downloaded music is stored in the path configured in `~/.gamdl/config.ini` under `output_path`. Defaults to `./Apple Music`.
 
 A download cache is kept at `~/.apple-music-manager/cache.json` to skip already-completed albums on subsequent runs.
+
+## Credits
+
+Apple Music API and download functionality powered by [gamdl](https://github.com/glomatico/gamdl).
+
+## System dependencies
+
+| Package | Purpose |
+|---------|---------|
+| libgpod | Read and write iPod iTunesDB |
+| ffmpeg | Audio processing |
+| mp4decrypt (widevine-aur) | Decrypt downloaded tracks |
+
+## Python dependencies
+
+| Package | Purpose |
+|---------|---------|
+| gamdl | Apple Music API and downloader |
+| textual | Terminal UI framework |
+| mutagen | Read audio file metadata |
+| cffi | C bindings for libgpod |
