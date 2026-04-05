@@ -1,8 +1,6 @@
 # podsync
 
-A terminal UI for syncing your Apple Music library to an iPod Classic, Nano, or Mini on Linux.
-
-Downloads all albums and playlists from your Apple Music account and copies them to a connected iPod, recreating your playlists on the device.
+Sync your entire Apple Music library to an iPod Classic, Nano, or Mini from the terminal.
 
 ## Screenshots
 
