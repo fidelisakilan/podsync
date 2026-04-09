@@ -87,7 +87,7 @@ def _load_cache() -> dict:
             return json.loads(CACHE_PATH.read_text())
         except Exception:
             pass
-    return {"version": 1, "albums": {}}
+    return {"version": 1, "albums": {}, "playlist_tracks": {}}
 
 
 def _save_cache(cache: dict) -> None:
@@ -250,13 +250,16 @@ class LogModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="log-modal-box"):
             yield Label("Log  (ESC or / to close)", id="log-modal-title")
-            yield Log(id="log-modal-content", auto_scroll=False)
+            yield Log(id="log-modal-content", auto_scroll=True)
 
     def on_mount(self) -> None:
         w = self.query_one("#log-modal-content", Log)
         for line in self._lines:
             w.write_line(line)
         w.scroll_end(animate=False)
+
+    def append_line(self, line: str) -> None:
+        self.query_one("#log-modal-content", Log).write_line(line)
 
 
 # ── app ───────────────────────────────────────────────────────────────────────
@@ -474,6 +477,10 @@ class IpodSyncApp(App):
     def _log(self, message: str) -> None:
         """Store a log line (viewable via / popup)."""
         self._log_lines.append(message)
+        for screen in self.screen_stack:
+            if isinstance(screen, LogModal):
+                screen.append_line(message)
+                break
 
     def _set_progress(
         self, phase: str = "", current: int = 0, total: int = 0
@@ -856,6 +863,81 @@ class IpodSyncApp(App):
 
         self._log(f"Phase 1 done — downloaded={ok} failed={fail} skipped={skip}")
 
+        # ── Phase 1.5: download playlist-only tracks ──────────────────────────
+        cache = _load_cache()
+        pt_cache: dict[str, str] = cache.setdefault("playlist_tracks", {})
+        # catalogId → local file path
+
+        # Build set of catalog IDs still needed by current playlists
+        wanted_catalog_ids: dict[str, str] = {}  # catalogId → title
+        for pl in self._playlists:
+            for t_data in pl["tracks"]:
+                attr = t_data.get("attributes", {})
+                catalog_id = (
+                    attr.get("playParams", {}).get("catalogId")
+                    or (t_data["id"] if not t_data["id"].startswith("i.") else None)
+                )
+                if catalog_id:
+                    wanted_catalog_ids[catalog_id] = attr.get("name", "")
+
+        # Delete playlist-only files no longer wanted by any playlist
+        orphaned = {cid: path for cid, path in pt_cache.items()
+                    if cid not in wanted_catalog_ids}
+        if orphaned:
+            self._log(f"Removing {len(orphaned)} playlist tracks no longer in any playlist…")
+            for cid, path in orphaned.items():
+                try:
+                    p = Path(path)
+                    if p.exists():
+                        p.unlink()
+                        self._log(f"  deleted {p.name}")
+                except Exception as e:
+                    self._log(f"  failed to delete {path}: {e}")
+                del pt_cache[cid]
+            _save_cache(cache)
+
+        # Find which wanted tracks aren't in local files yet
+        base = Path(self.output_path)
+        local_titles: set[str] = set()
+        for f in list(base.rglob("*.m4a")) + list(base.rglob("*.mp4")):
+            meta = _read_audio_meta(f)
+            if meta:
+                local_titles.add(meta.get("title", "").lower())
+
+        missing: dict[str, str] = {
+            cid: title for cid, title in wanted_catalog_ids.items()
+            if title.lower() not in local_titles
+        }
+
+        if missing:
+            self._log(f"Phase 1.5: downloading {len(missing)} playlist-only tracks")
+            self._set_progress("Phase 1.5: Playlist tracks", 0, len(missing))
+            pl_ok = pl_fail = 0
+            for pidx, (catalog_id, title) in enumerate(missing.items(), 1):
+                if self._stop:
+                    break
+                self._set_progress(current=pidx, total=len(missing))
+                try:
+                    song_resp = await self._api.get_song(catalog_id)
+                    if not song_resp or not song_resp.get("data"):
+                        pl_fail += 1
+                        continue
+                    item = await self._dl.get_single_download_item(song_resp["data"][0])
+                    if item.final_path and Path(item.final_path).exists() and not self.overwrite:
+                        pt_cache[catalog_id] = str(item.final_path)
+                        pl_ok += 1
+                        continue
+                    await self._dl.download(item)
+                    if item.final_path:
+                        pt_cache[catalog_id] = str(item.final_path)
+                        _save_cache(cache)
+                    self._log(f"  ✓ {title}")
+                    pl_ok += 1
+                except Exception as e:
+                    self._log(f"  ✗ {title}: {e}")
+                    pl_fail += 1
+            self._log(f"Phase 1.5 done — downloaded={pl_ok} failed={pl_fail}")
+
         # ── Phase 2: sync to iPod ─────────────────────────────────────────────
         if not self._ipod_mount:
             self._log("No iPod detected — connect your iPod and press [s] to sync again.")
@@ -883,15 +965,31 @@ class IpodSyncApp(App):
 
         try:
             db = IpodDatabase(self._ipod_mount)
-            db.open()
+            await asyncio.to_thread(db.open)
         except Exception as e:
             self._log(f"Failed to open iPod: {e}")
             return
 
         try:
             self._log("Reading existing iPod tracks…")
-            ipod_map = db.build_track_map()
+            ipod_map = await asyncio.to_thread(db.build_track_map)
             self._log(f"iPod has {len(ipod_map)} existing tracks")
+
+            # Build local library key set for stale-track detection
+            local_keys: set[tuple[str, str]] = set()
+            for f in audio_files:
+                meta = _read_audio_meta(f)
+                if meta:
+                    local_keys.add((meta.get("artist", ""), meta.get("title", "")))
+
+            # Remove iPod tracks no longer in local library
+            stale = [(key, t) for key, t in ipod_map.items() if key not in local_keys]
+            if stale:
+                self._log(f"Removing {len(stale)} stale tracks from iPod…")
+                for key, t in stale:
+                    await asyncio.to_thread(db.remove_track, t)
+                    del ipod_map[key]
+                self._log(f"Removed {len(stale)} stale tracks")
 
             added = skipped = failed = 0
             for i, f in enumerate(audio_files, 1):
@@ -909,17 +1007,21 @@ class IpodSyncApp(App):
                     skipped += 1
                     continue
                 try:
-                    t = db.add_track(str(f), meta)
+                    t = await asyncio.to_thread(db.add_track, str(f), meta)
                     ipod_map[key] = t
                     added += 1
                     if added % 10 == 0:
                         self._log(f"  copied {added} tracks…  (skipped {skipped})")
-                    await asyncio.sleep(0)   # yield after each file copy
                 except Exception as e:
                     self._log(f"  ✗ {f.name}: {e}")
                     failed += 1
 
             self._log(f"Tracks — added={added} skipped={skipped} failed={failed}")
+
+            # Build title-only fallback map for artist-name mismatches
+            title_map: dict[str, object] = {}
+            for (artist, title), t in ipod_map.items():
+                title_map.setdefault(title.lower(), t)
 
             n_pl = len(self._playlists)
             self._set_progress("Phase 2: Playlists", 0, n_pl)
@@ -931,20 +1033,29 @@ class IpodSyncApp(App):
                 pl_name = pl_data["name"]
                 try:
                     pl = db.ensure_playlist(pl_name)
+                    db.clear_playlist(pl)
                     pl_added = 0
+                    missed = []
                     for t_data in pl_data["tracks"]:
-                        attr = t_data.get("attributes", {})
-                        key  = (attr.get("artistName", ""), attr.get("name", ""))
-                        if key in ipod_map:
-                            db.add_track_to_playlist(ipod_map[key], pl)
+                        attr  = t_data.get("attributes", {})
+                        key   = (attr.get("artistName", ""), attr.get("name", ""))
+                        title = attr.get("name", "")
+                        track = ipod_map.get(key) or title_map.get(title.lower())
+                        if track:
+                            db.add_track_to_playlist(track, pl)
                             pl_added += 1
-                    self._log(f"  ✓ {pl_name!r}: {pl_added} tracks")
+                        else:
+                            missed.append(key)
+                    self._log(f"  ✓ {pl_name!r}: {pl_added}/{pl_added + len(missed)} tracks")
+                    for artist, title in missed[:5]:
+                        self._log(f"    miss: {artist!r} — {title!r}")
                 except Exception as e:
                     self._log(f"  ✗ {pl_name!r}: {e}")
 
             self._log("Writing iTunesDB…")
             self._set_progress("Writing iTunesDB…", n_pl, n_pl)
-            db.save()
+            db.fix_playlist_links()
+            await asyncio.to_thread(db.save)
             self._log("✓ Sync complete — eject your iPod safely.")
             self._set_progress("✓ Sync complete", n_pl, n_pl)
 

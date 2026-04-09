@@ -151,6 +151,81 @@ void gpod_playlist_add_track(Itdb_Playlist *pl, Itdb_Track *track) {
         itdb_playlist_add_track(pl, track, -1);
 }
 
+/* Remove all tracks from a playlist (does not delete the tracks from the iPod). */
+void gpod_playlist_clear(Itdb_Playlist *pl) {
+    while (pl->members)
+        itdb_playlist_remove_track(pl, (Itdb_Track *)pl->members->data);
+}
+
+/* Replace invalid UTF-8 bytes with '?'; always returns a valid UTF-8 heap string. */
+static char* _sanitize_utf8(char *s) {
+    if (!s) return g_strdup("");
+    if (g_utf8_validate(s, -1, NULL)) return s;
+    GString *out = g_string_new(NULL);
+    const char *p = s;
+    const char *inv;
+    while (*p) {
+        if (g_utf8_validate(p, -1, &inv)) {
+            g_string_append(out, p);
+            break;
+        }
+        if (inv > p)
+            g_string_append_len(out, p, inv - p);
+        g_string_append_c(out, '?');
+        p = inv + 1;
+    }
+    g_free(s);
+    return g_string_free(out, FALSE);
+}
+
+/* Sanitize all track and playlist strings in the database to valid UTF-8. */
+void gpod_sanitize_strings(Itdb_iTunesDB *db) {
+    for (GList *l = db->tracks; l; l = l->next) {
+        Itdb_Track *t = (Itdb_Track *)l->data;
+        t->title       = _sanitize_utf8(t->title);
+        t->artist      = _sanitize_utf8(t->artist);
+        t->album       = _sanitize_utf8(t->album);
+        t->genre       = _sanitize_utf8(t->genre);
+        t->composer    = _sanitize_utf8(t->composer);
+        t->albumartist = _sanitize_utf8(t->albumartist);
+    }
+    for (GList *l = db->playlists; l; l = l->next) {
+        Itdb_Playlist *pl = (Itdb_Playlist *)l->data;
+        if (pl->name)
+            pl->name = _sanitize_utf8(pl->name);
+    }
+}
+
+/* Remove broken playlist members: track->itdb != db OR not in master playlist. */
+void gpod_fix_playlist_links(Itdb_iTunesDB *db) {
+    Itdb_Playlist *mpl = itdb_playlist_mpl(db);
+    for (GList *l = db->playlists; l; l = l->next) {
+        Itdb_Playlist *pl = (Itdb_Playlist *)l->data;
+        GList *m = pl->members;
+        while (m) {
+            GList *next = m->next;
+            Itdb_Track *t = (Itdb_Track *)m->data;
+            gboolean bad = (!t || t->itdb != db ||
+                            (mpl && !itdb_playlist_contains_track(mpl, t)));
+            if (bad) {
+                pl->members = g_list_remove(pl->members, t);
+                if (pl->num > 0) pl->num--;
+            }
+            m = next;
+        }
+    }
+}
+
+/* Delete a track from the iPod: removes the file, unregisters from all playlists and DB. */
+void gpod_remove_track(Itdb_iTunesDB *db, Itdb_Track *track) {
+    char *path = itdb_filename_on_ipod(track);
+    if (path) {
+        remove(path);
+        g_free(path);
+    }
+    itdb_track_remove(track);
+}
+
 const char* gpod_track_title(Itdb_Track *t)  { return t->title  ? t->title  : ""; }
 const char* gpod_track_artist(Itdb_Track *t) { return t->artist ? t->artist : ""; }
 const char* gpod_track_album(Itdb_Track *t)  { return t->album  ? t->album  : ""; }
@@ -180,6 +255,10 @@ Itdb_Track*    gpod_add_track(Itdb_iTunesDB *db, const char *src,
                                int bitrate, int samplerate, int year);
 Itdb_Playlist* gpod_ensure_playlist(Itdb_iTunesDB *db, const char *name);
 void           gpod_playlist_add_track(Itdb_Playlist *pl, Itdb_Track *track);
+void           gpod_playlist_clear(Itdb_Playlist *pl);
+void           gpod_sanitize_strings(Itdb_iTunesDB *db);
+void           gpod_fix_playlist_links(Itdb_iTunesDB *db);
+void           gpod_remove_track(Itdb_iTunesDB *db, Itdb_Track *track);
 const char*    gpod_track_title(Itdb_Track *t);
 const char*    gpod_track_artist(Itdb_Track *t);
 const char*    gpod_track_album(Itdb_Track *t);
@@ -280,6 +359,7 @@ class IpodDatabase:
             err = ffi.string(lib.gpod_last_error()).decode(errors="replace")
             raise RuntimeError(f"Failed to open iPod database at {self.mountpoint!r}: {err}")
         self._db = db
+        lib.gpod_sanitize_strings(self._db)
 
     def save(self) -> None:
         if not lib.gpod_save(self._db):
@@ -358,6 +438,15 @@ class IpodDatabase:
 
     def add_track_to_playlist(self, track, playlist) -> None:
         lib.gpod_playlist_add_track(playlist, track)
+
+    def clear_playlist(self, playlist) -> None:
+        lib.gpod_playlist_clear(playlist)
+
+    def remove_track(self, track) -> None:
+        lib.gpod_remove_track(self._db, track)
+
+    def fix_playlist_links(self) -> None:
+        lib.gpod_fix_playlist_links(self._db)
 
     # ── bulk helpers ──────────────────────────────────────────────────────────
 
