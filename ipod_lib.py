@@ -229,6 +229,28 @@ void gpod_remove_track(Itdb_iTunesDB *db, Itdb_Track *track) {
 const char* gpod_track_title(Itdb_Track *t)  { return t->title  ? t->title  : ""; }
 const char* gpod_track_artist(Itdb_Track *t) { return t->artist ? t->artist : ""; }
 const char* gpod_track_album(Itdb_Track *t)  { return t->album  ? t->album  : ""; }
+
+int gpod_playlist_count(Itdb_iTunesDB *db) {
+    return (int)g_list_length(db->playlists);
+}
+
+Itdb_Playlist* gpod_playlist_at(Itdb_iTunesDB *db, int idx) {
+    GList *l = g_list_nth(db->playlists, (guint)idx);
+    return l ? (Itdb_Playlist *)l->data : NULL;
+}
+
+const char* gpod_playlist_name(Itdb_Playlist *pl) {
+    return pl->name ? pl->name : "";
+}
+
+int gpod_playlist_is_mpl(Itdb_Playlist *pl) {
+    return (int)itdb_playlist_is_mpl(pl);
+}
+
+/* Remove a playlist from the database (does not delete its tracks). */
+void gpod_remove_playlist(Itdb_iTunesDB *db, Itdb_Playlist *pl) {
+    itdb_playlist_remove(pl);
+}
 """
 
 _CDEF = """
@@ -262,6 +284,11 @@ void           gpod_remove_track(Itdb_iTunesDB *db, Itdb_Track *track);
 const char*    gpod_track_title(Itdb_Track *t);
 const char*    gpod_track_artist(Itdb_Track *t);
 const char*    gpod_track_album(Itdb_Track *t);
+int            gpod_playlist_count(Itdb_iTunesDB *db);
+Itdb_Playlist* gpod_playlist_at(Itdb_iTunesDB *db, int idx);
+const char*    gpod_playlist_name(Itdb_Playlist *pl);
+int            gpod_playlist_is_mpl(Itdb_Playlist *pl);
+void           gpod_remove_playlist(Itdb_iTunesDB *db, Itdb_Playlist *pl);
 """
 
 # ── module-level state ────────────────────────────────────────────────────────
@@ -354,12 +381,30 @@ class IpodDatabase:
     def open(self) -> None:
         if not _GPOD_AVAILABLE:
             raise RuntimeError(f"libgpod not available: {_GPOD_ERROR}")
+        self._fix_otg_playlist()
         db = lib.gpod_open(self.mountpoint.encode())
         if db == ffi.NULL:
             err = ffi.string(lib.gpod_last_error()).decode(errors="replace")
             raise RuntimeError(f"Failed to open iPod database at {self.mountpoint!r}: {err}")
         self._db = db
         lib.gpod_sanitize_strings(self._db)
+
+    def _fix_otg_playlist(self) -> None:
+        """Remove corrupted OTG* files before libgpod tries to parse them.
+
+        libgpod will abort the entire database open if any OTG file exists but
+        is too short to be valid.  These files only hold the on-device
+        On-The-Go queue, so deleting them is safe.
+        """
+        itunes_dir = Path(self.mountpoint) / "iPod_Control" / "iTunes"
+        for otg in itunes_dir.glob("OTG*"):
+            size = otg.stat().st_size
+            if size < 8:
+                try:
+                    otg.unlink()
+                    print(f"Removed corrupted {otg.name} ({size} bytes)", flush=True)
+                except OSError as e:
+                    print(f"Warning: could not remove {otg.name}: {e}", flush=True)
 
     def save(self) -> None:
         if not lib.gpod_save(self._db):
@@ -447,6 +492,21 @@ class IpodDatabase:
 
     def fix_playlist_links(self) -> None:
         lib.gpod_fix_playlist_links(self._db)
+
+    def list_playlists(self) -> list[tuple[str, object]]:
+        """Return [(name, playlist_ptr)] for all non-master playlists."""
+        result = []
+        n = lib.gpod_playlist_count(self._db)
+        for i in range(n):
+            pl = lib.gpod_playlist_at(self._db, i)
+            if pl == ffi.NULL or lib.gpod_playlist_is_mpl(pl):
+                continue
+            name = ffi.string(lib.gpod_playlist_name(pl)).decode(errors="replace")
+            result.append((name, pl))
+        return result
+
+    def remove_playlist(self, playlist) -> None:
+        lib.gpod_remove_playlist(self._db, playlist)
 
     # ── bulk helpers ──────────────────────────────────────────────────────────
 

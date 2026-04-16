@@ -438,6 +438,7 @@ class IpodSyncApp(App):
         self._albums:    list[dict] = []
         self._playlists: list[dict] = []
         self._ipod_mount: str | None = None
+        self._fetching = True   # True while _init is still running
         self._busy   = False
         self._stop   = False
         self._g_pressed = False
@@ -514,6 +515,7 @@ class IpodSyncApp(App):
         if not cookies.exists():
             self._log(f"cookies.txt not found: {cookies}")
             self._set_progress("Error")
+            self._fetching = False
             return
 
         self._set_progress("Authenticating…")
@@ -525,11 +527,13 @@ class IpodSyncApp(App):
         except Exception as e:
             self._log(f"Auth failed: {e}")
             self._set_progress("Auth failed")
+            self._fetching = False
             return
 
         if not self._api.active_subscription:
             self._log("No active Apple Music subscription.")
             self._set_progress("No subscription")
+            self._fetching = False
             return
 
         self._log(f"Signed in — {self._api.storefront.upper()}")
@@ -565,6 +569,7 @@ class IpodSyncApp(App):
         except Exception as e:
             self._log(f"Album fetch failed: {e}")
             self._set_progress("Fetch failed")
+            self._fetching = False
             return
 
         # ── fetch playlists ───────────────────────────────────────────────────
@@ -597,6 +602,7 @@ class IpodSyncApp(App):
                 tracks = []
             self._playlists.append({"id": pm["id"], "name": pm["name"], "tracks": tracks})
 
+        self._fetching = False
         self._rebuild_playlist_panel()
         total_pl_tracks = sum(len(p["tracks"]) for p in self._playlists)
         summary = (
@@ -773,6 +779,9 @@ class IpodSyncApp(App):
         if self._busy:
             self._log("Sync already in progress.")
             return
+        if self._fetching:
+            self._log("Still fetching library — please wait.")
+            return
         if not self._dl:
             self._log("Not ready yet — waiting for library load.")
             return
@@ -787,6 +796,7 @@ class IpodSyncApp(App):
         self._set_progress("Phase 1: Downloading", 0, len(self._albums))
         self._log("Phase 1: downloading library")
         cache = _load_cache()
+        file_manifest: dict[str, list[str]] = cache.setdefault("file_manifest", {})
         ok = fail = skip = 0
         total = len(self._albums)
 
@@ -834,6 +844,7 @@ class IpodSyncApp(App):
                 fail += 1
                 continue
 
+            album_files: list[str] = []
             for tidx, item in enumerate(items, 1):
                 if self._stop:
                     break
@@ -842,16 +853,20 @@ class IpodSyncApp(App):
                     if item.media_metadata else "?"
                 )
                 if not self.overwrite and item.final_path and Path(item.final_path).exists():
+                    album_files.append(str(item.final_path))
                     ok += 1
                     continue
                 try:
                     await self._dl.download(item)
+                    if item.final_path:
+                        album_files.append(str(item.final_path))
                     self._log(f"  ✓ [{tidx}/{len(items)}] {track_name}")
                     ok += 1
                 except Exception as e:
                     self._log(f"  ✗ [{tidx}/{len(items)}] {track_name}: {e}")
                     fail += 1
 
+            file_manifest[aid] = album_files
             _cache_album(cache, aid, artist, name)
 
         if self._stop:
@@ -862,6 +877,41 @@ class IpodSyncApp(App):
             return
 
         self._log(f"Phase 1 done — downloaded={ok} failed={fail} skipped={skip}")
+
+        # ── Cleanup: remove albums that left the Apple Music library ──────────
+        # Build playlist key set first so we don't delete tracks still in a playlist
+        playlist_track_keys: set[tuple[str, str]] = set()
+        for pl in self._playlists:
+            for t_data in pl["tracks"]:
+                attr = t_data.get("attributes", {})
+                playlist_track_keys.add((attr.get("artistName", ""), attr.get("name", "")))
+
+        current_album_ids = {a["id"] for a in self._albums}
+        stale_album_ids = [aid for aid in list(cache["albums"].keys())
+                           if aid not in current_album_ids]
+        if stale_album_ids:
+            self._log(f"Removing {len(stale_album_ids)} albums no longer in library…")
+            removed_files = 0
+            for aid in stale_album_ids:
+                for fpath in file_manifest.get(aid, []):
+                    try:
+                        p = Path(fpath)
+                        if not p.exists():
+                            continue
+                        meta = _read_audio_meta(p)
+                        if meta:
+                            key = (meta.get("artist", ""), meta.get("title", ""))
+                            if key in playlist_track_keys:
+                                continue  # still referenced by a playlist — keep it
+                        p.unlink()
+                        removed_files += 1
+                    except Exception as e:
+                        self._log(f"  warning: could not delete {fpath}: {e}")
+                del cache["albums"][aid]
+                file_manifest.pop(aid, None)
+            if removed_files:
+                self._log(f"  deleted {removed_files} local files for removed albums")
+            _save_cache(cache)
 
         # ── Phase 1.5: download playlist-only tracks ──────────────────────────
         cache = _load_cache()
@@ -945,20 +995,33 @@ class IpodSyncApp(App):
             self._busy = False
             return
 
+        # Compute desired state once: local files (= current library) + playlist tracks.
+        # This single set drives all iPod cleanup decisions.
+        base = Path(self.output_path)
+        audio_files = list(base.rglob("*.m4a")) + list(base.rglob("*.mp4"))
+        desired_keys: set[tuple[str, str]] = set(playlist_track_keys)
+        for f in audio_files:
+            meta = _read_audio_meta(f)
+            if meta:
+                desired_keys.add((meta.get("artist", ""), meta.get("title", "")))
+        self._log(f"Desired state: {len(desired_keys)} tracks (library + playlists)")
+
         self._log(f"Phase 2: syncing to iPod at {self._ipod_mount}")
-        await self._sync_to_ipod()
+        await self._sync_to_ipod(audio_files, desired_keys)
 
         self._busy = False
 
-    async def _sync_to_ipod(self) -> None:
+    async def _sync_to_ipod(
+        self,
+        audio_files: list,
+        desired_keys: set[tuple[str, str]],
+    ) -> None:
         from ipod_lib import IpodDatabase, _GPOD_AVAILABLE, _GPOD_ERROR
 
         if not _GPOD_AVAILABLE:
             self._log(f"libgpod not available: {_GPOD_ERROR}")
             return
 
-        base = Path(self.output_path)
-        audio_files = list(base.rglob("*.m4a")) + list(base.rglob("*.mp4"))
         n_files = len(audio_files)
         self._log(f"Found {n_files} local audio files")
         self._set_progress("Phase 2: Syncing iPod", 0, n_files)
@@ -975,18 +1038,13 @@ class IpodSyncApp(App):
             ipod_map = await asyncio.to_thread(db.build_track_map)
             self._log(f"iPod has {len(ipod_map)} existing tracks")
 
-            # Build local library key set for stale-track detection
-            local_keys: set[tuple[str, str]] = set()
-            for f in audio_files:
-                meta = _read_audio_meta(f)
-                if meta:
-                    local_keys.add((meta.get("artist", ""), meta.get("title", "")))
-
-            # Remove iPod tracks no longer in local library
-            stale = [(key, t) for key, t in ipod_map.items() if key not in local_keys]
+            # Remove iPod tracks no longer in the Apple Music library or any playlist
+            stale = [(key, t) for key, t in ipod_map.items() if key not in desired_keys]
             if stale:
-                self._log(f"Removing {len(stale)} stale tracks from iPod…")
+                self._log(f"Removing {len(stale)} tracks from iPod (no longer in library or playlists)…")
                 for key, t in stale:
+                    artist, title = key
+                    self._log(f"  - {artist!r} — {title!r}")
                     await asyncio.to_thread(db.remove_track, t)
                     del ipod_map[key]
                 self._log(f"Removed {len(stale)} stale tracks")
@@ -1022,6 +1080,17 @@ class IpodSyncApp(App):
             title_map: dict[str, object] = {}
             for (artist, title), t in ipod_map.items():
                 title_map.setdefault(title.lower(), t)
+
+            # Remove iPod playlists not present in Apple Music library
+            apple_music_names = {pl["name"] for pl in self._playlists}
+            ipod_playlists = await asyncio.to_thread(db.list_playlists)
+            removed_pls = []
+            for pl_name, pl_ptr in ipod_playlists:
+                if pl_name not in apple_music_names:
+                    await asyncio.to_thread(db.remove_playlist, pl_ptr)
+                    removed_pls.append(pl_name)
+            if removed_pls:
+                self._log(f"Removed {len(removed_pls)} iPod-only playlists: {removed_pls}")
 
             n_pl = len(self._playlists)
             self._set_progress("Phase 2: Playlists", 0, n_pl)
