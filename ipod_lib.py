@@ -407,6 +407,7 @@ class IpodDatabase:
                     print(f"Warning: could not remove {otg.name}: {e}", flush=True)
 
     def save(self) -> None:
+        lib.gpod_sanitize_strings(self._db)
         if not lib.gpod_save(self._db):
             err = ffi.string(lib.gpod_last_error()).decode(errors="replace")
             raise RuntimeError(f"Failed to write iTunesDB: {err}")

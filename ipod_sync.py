@@ -97,6 +97,15 @@ def _save_cache(cache: dict) -> None:
     tmp.replace(CACHE_PATH)
 
 
+def _save_library_cache(cache: dict, albums: list, playlists: list) -> None:
+    cache["library"] = {
+        "fetched_at": datetime.now().isoformat(),
+        "albums": albums,
+        "playlists": playlists,
+    }
+    _save_cache(cache)
+
+
 def _cache_album(cache: dict, album_id: str, artist: str, album: str) -> None:
     cache["albums"][album_id] = {
         "completed_at": datetime.now().isoformat(),
@@ -422,6 +431,7 @@ class IpodSyncApp(App):
         Binding("ctrl+f", "page_down",     "Page Down",     show=False),
         Binding("ctrl+b", "page_up",       "Page Up",       show=False),
         Binding("/",      "show_log",      "Log",           show=True),
+        Binding("r",      "refresh",       "Refresh",       show=True),
         Binding("s",      "sync",          "Sync All",      show=True),
         Binding("x",      "stop",          "Stop",          show=True),
         Binding("q",      "quit",          "Quit",          show=True),
@@ -545,17 +555,59 @@ class IpodSyncApp(App):
             self.overwrite,
         )
 
-        # ── fetch albums ──────────────────────────────────────────────────────
+        # ── load from cache if available ──────────────────────────────────────
+        cache = _load_cache()
+        lib = cache.get("library")
+        if lib and lib.get("albums") is not None:
+            self._albums    = lib["albums"]
+            self._playlists = lib["playlists"]
+            self._fetching  = False
+            fetched_at = lib.get("fetched_at", "")[:16].replace("T", " ")
+            total_pl_tracks = sum(len(p["tracks"]) for p in self._playlists)
+            self._log(
+                f"Loaded from cache ({fetched_at}) — "
+                f"{len(self._albums)} albums · {len(self._playlists)} playlists · "
+                f"{total_pl_tracks} playlist tracks"
+            )
+            self._log("Press [r] to refresh library from Apple Music.")
+            self._set_progress(
+                "Ready (cached)  [s] sync  [r] refresh",
+                len(self._albums), len(self._albums),
+            )
+            self._rebuild_playlist_panel()
+            return
+
+        self._fetch_library()
+
+    @work(thread=False)
+    async def _fetch_library(self) -> None:
+        """Fetch albums + playlists from Apple Music and save to cache."""
+        self._fetching = True
+
         self._set_progress("Fetching library", 0, 0)
         self._log("Fetching library albums…")
         try:
             albums, offset, limit, album_total = [], 0, 100, 0
+            # Check total before paginating — skip full fetch if nothing changed.
+            probe = await self._api._amp_request(
+                "/v1/me/library/albums", {"limit": 1, "offset": 0}
+            )
+            album_total = probe.get("meta", {}).get("total", 0)
+            cache = _load_cache()
+            lib = cache.get("library", {})
+            if lib.get("albums") and len(lib["albums"]) == album_total:
+                self._log(f"Album count unchanged ({album_total}) — skipping full fetch.")
+                self._albums    = lib["albums"]
+                self._playlists = lib["playlists"]
+                self._fetching  = False
+                self._rebuild_playlist_panel()
+                self._set_progress("Ready  [s] sync", album_total, album_total)
+                return
             while True:
                 resp = await self._api._amp_request(
                     "/v1/me/library/albums", {"limit": limit, "offset": offset}
                 )
-                # Grab the total from the first response
-                if album_total == 0:
+                if not album_total:
                     album_total = resp.get("meta", {}).get("total", 0)
                 batch = resp.get("data", [])
                 albums.extend(batch)
@@ -572,7 +624,6 @@ class IpodSyncApp(App):
             self._fetching = False
             return
 
-        # ── fetch playlists ───────────────────────────────────────────────────
         self._set_progress("Fetching playlists", 0, 0)
         self._log("Fetching playlists…")
         try:
@@ -595,12 +646,15 @@ class IpodSyncApp(App):
                     _fetch_playlist_tracks(self._api, pm["id"]), timeout=10
                 )
             except asyncio.TimeoutError:
-                self._log(f"    timed out — skipping")
+                self._log("    timed out — skipping")
                 tracks = []
             except Exception as e:
                 self._log(f"    error: {e}")
                 tracks = []
             self._playlists.append({"id": pm["id"], "name": pm["name"], "tracks": tracks})
+
+        cache = _load_cache()
+        _save_library_cache(cache, self._albums, self._playlists)
 
         self._fetching = False
         self._rebuild_playlist_panel()
@@ -774,6 +828,19 @@ class IpodSyncApp(App):
             self._log("⏹ stopping after current track…")
         else:
             self._log("Nothing running.")
+
+    def action_refresh(self) -> None:
+        if self._busy:
+            self._log("Sync in progress — cannot refresh now.")
+            return
+        if self._fetching:
+            self._log("Already fetching.")
+            return
+        if not self._api:
+            self._log("Not authenticated yet.")
+            return
+        self._log("Refreshing library from Apple Music…")
+        self._fetch_library()
 
     def action_sync(self) -> None:
         if self._busy:
