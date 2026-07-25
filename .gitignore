@@ -8,6 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets and staging
 cookies.txt
 tmp/
-Apple Music/

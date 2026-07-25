@@ -1,98 +1,45 @@
-# podsync
+# ipod-sync
 
-Sync your entire Apple Music library to an iPod Classic, Nano, or Mini from the terminal.
+One-way sync of your **Apple Music library** (songs + albums, no playlists) to an
+**iPod Classic / Nano / Mini** on Linux.
 
-## Screenshots
+Each run makes the iPod mirror your library:
 
-![Library view](screenshots/library.png)
-![Playlist view](screenshots/playlist.png)
+1. Detects your iPod — or lists unmounted USB partitions and mounts the one you pick.
+2. Signs in to Apple Music (first run opens a browser window to log in; cookies are cached).
+3. Fetches every song in your library and compares against what's on the iPod.
+4. Downloads only the missing tracks (staged in `tmp/`, deleted after copying).
+5. Copies them to the iPod and removes tracks no longer in your library.
+6. If everything succeeded, unmounts and powers off the iPod — safe to unplug.
+
+## Requirements
+
+- An active Apple Music subscription
+- `libgpod` (`pacman -S libgpod`) plus `pkg-config` and a C compiler
+- `ffmpeg` and `mp4decrypt` (AUR: `widevine-aur`) in PATH
+- [uv](https://docs.astral.sh/uv/)
 
 ## Setup
 
-1. Clone the repository
-
-```
-git clone https://github.com/youruser/podsync
-cd podsync
-```
-
-2. Install system dependencies (Arch Linux)
-
-```
-sudo pacman -S libgpod ffmpeg
-yay -S widevine-aur
-```
-
-3. Install Python dependencies (requires Python 3.13 and [uv](https://github.com/astral-sh/uv))
-
-```
+```sh
 uv sync
-```
-
-4. Get your Apple Music cookies. Install the [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) Chrome extension, open music.apple.com while signed in, and export cookies in Netscape format.
-
-5. Place the exported file as `cookies.txt` in the project folder, or pass its path via `--cookies`.
-
-6. Mount your iPod by opening your file manager (Nautilus, Thunar, etc.) and clicking the iPod in the sidebar.
-
-7. Run the app
-
-```
-uv run python ipod_sync.py
-```
-
-## Options
-
-```
---cookies PATH    Path to cookies.txt (default: ./cookies.txt)
---overwrite       Re-download albums that already exist locally
+uv run playwright install chromium
 ```
 
 ## Usage
 
-The app loads your full library on startup. Press `s` to start a sync. The app downloads any missing albums, then copies new tracks to the iPod and recreates your playlists on the device.
+```sh
+uv run ipod-sync            # full sync
+uv run ipod-sync --dry-run  # show what would change, touch nothing
+uv run ipod-sync --relogin  # force a fresh Apple Music browser login
+```
 
-Navigation:
-
-| Key | Action |
-|-----|--------|
-| Tab | Switch between playlists and track panes |
-| j / k | Move cursor down / up |
-| Enter | Focus track pane |
-| Escape / Backspace | Return to playlist pane |
-| g g | Jump to top |
-| G | Jump to bottom |
-| Ctrl+f / Ctrl+b | Page down / up |
-| s | Start sync |
-| x | Stop sync |
-| / | Open log viewer |
-| q | Quit |
-
-The iPod connection status and storage usage are shown in the bottom right. The device must be mounted before starting a sync.
-
-## Notes
-
-Downloaded music is stored in the path configured in `~/.gamdl/config.ini` under `output_path`. Defaults to `./Apple Music`.
-
-A download cache is kept at `~/.apple-music-manager/cache.json` to skip already-completed albums on subsequent runs.
+State lives in `~/.apple-music-manager/` (cookies, tag-alias map, compiled
+libgpod extension). If a run fails, the device is left mounted and partially
+downloaded files are kept so the next run resumes where it left off.
 
 ## Credits
 
-Apple Music API and download functionality powered by [gamdl](https://github.com/glomatico/gamdl).
-
-## System dependencies
-
-| Package | Purpose |
-|---------|---------|
-| libgpod | Read and write iPod iTunesDB |
-| ffmpeg | Audio processing |
-| mp4decrypt (widevine-aur) | Decrypt downloaded tracks |
-
-## Python dependencies
-
-| Package | Purpose |
-|---------|---------|
-| gamdl | Apple Music API and downloader |
-| textual | Terminal UI framework |
-| mutagen | Read audio file metadata |
-| cffi | C bindings for libgpod |
+Apple Music API and download functionality powered by
+[gamdl](https://github.com/glomatico/gamdl); iPod database access via
+[libgpod](https://sourceforge.net/projects/gtkpod/).
