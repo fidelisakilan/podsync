@@ -79,19 +79,30 @@ class Counters:
 @dataclass
 class Aliases:
     map: dict[str, Key] = field(default_factory=dict)
+    unavailable: set[str] = field(default_factory=set)
 
     @classmethod
     def load(cls) -> "Aliases":
         try:
-            raw = json.loads(STATE_PATH.read_text())["aliases"]
-            return cls({cid: tuple(key) for cid, key in raw.items()})
+            raw = json.loads(STATE_PATH.read_text())
+            return cls(
+                {cid: tuple(key) for cid, key in raw.get("aliases", {}).items()},
+                set(raw.get("unavailable", [])),
+            )
         except Exception:
             return cls()
 
     def save(self) -> None:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"aliases": {c: list(k) for c, k in self.map.items()}}))
+        tmp.write_text(
+            json.dumps(
+                {
+                    "aliases": {c: list(k) for c, k in self.map.items()},
+                    "unavailable": sorted(self.unavailable),
+                }
+            )
+        )
         tmp.replace(STATE_PATH)
 
     def key_for(self, song: LibrarySong) -> Key:
@@ -102,16 +113,41 @@ class Aliases:
             self.map[song.catalog_id] = file_key
             self.save()
 
+    def mark_unavailable(self, song: LibrarySong) -> None:
+        self.unavailable.add(song.catalog_id)
+        self.save()
+
 
 def diff(
     songs: list[LibrarySong], ipod_keys: set[Key], aliases: Aliases
-) -> tuple[list[LibrarySong], set[Key]]:
+) -> tuple[list[LibrarySong], set[Key], int]:
     wanted = {aliases.key_for(s) for s in songs}
-    missing = [s for s in songs if aliases.key_for(s) not in ipod_keys]
+    missing = [
+        s
+        for s in songs
+        if aliases.key_for(s) not in ipod_keys and s.catalog_id not in aliases.unavailable
+    ]
+    known_unavailable = sum(1 for s in songs if s.catalog_id in aliases.unavailable)
     stale = ipod_keys - wanted
-    return missing, stale
+    return missing, stale, known_unavailable
 
 
 def clean_staging() -> None:
     if STAGING_DIR.exists():
         shutil.rmtree(STAGING_DIR, ignore_errors=True)
+
+
+def find_orphans(db, mountpoint: str) -> tuple[list[Path], int]:
+    referenced = {p.casefold() for p in db.ipod_paths()}
+    music = Path(mountpoint) / "iPod_Control" / "Music"
+    orphans = []
+    total_bytes = 0
+    if music.is_dir():
+        for f in music.rglob("*"):
+            if not f.is_file():
+                continue
+            rel = "/" + str(f.relative_to(mountpoint))
+            if rel.casefold() not in referenced:
+                orphans.append(f)
+                total_bytes += f.stat().st_size
+    return orphans, total_bytes

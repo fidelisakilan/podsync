@@ -216,19 +216,27 @@ void gpod_fix_playlist_links(Itdb_iTunesDB *db) {
     }
 }
 
-/* Delete a track from the iPod: removes the file, unregisters from all playlists and DB. */
+/* Delete a track from the iPod: removes the file, unregisters from all playlists and DB.
+ * Playlists (including the master playlist) must be purged BEFORE itdb_track_remove:
+ * it only unlinks from db->tracks and frees the struct, leaving any remaining playlist
+ * members dangling, which kills itdb_write ("prepare_itdb_for_write: assertion 'link'"). */
 void gpod_remove_track(Itdb_iTunesDB *db, Itdb_Track *track) {
     char *path = itdb_filename_on_ipod(track);
     if (path) {
         remove(path);
         g_free(path);
     }
+    for (GList *l = db->playlists; l; l = l->next)
+        itdb_playlist_remove_track((Itdb_Playlist *)l->data, track);
     itdb_track_remove(track);
 }
 
 const char* gpod_track_title(Itdb_Track *t)  { return t->title  ? t->title  : ""; }
 const char* gpod_track_artist(Itdb_Track *t) { return t->artist ? t->artist : ""; }
 const char* gpod_track_album(Itdb_Track *t)  { return t->album  ? t->album  : ""; }
+
+/* Colon-separated on-device path (":iPod_Control:Music:F12:XXXX.m4a"), "" if unset. */
+const char* gpod_track_ipod_path(Itdb_Track *t) { return t->ipod_path ? t->ipod_path : ""; }
 
 int gpod_playlist_count(Itdb_iTunesDB *db) {
     return (int)g_list_length(db->playlists);
@@ -284,6 +292,7 @@ void           gpod_remove_track(Itdb_iTunesDB *db, Itdb_Track *track);
 const char*    gpod_track_title(Itdb_Track *t);
 const char*    gpod_track_artist(Itdb_Track *t);
 const char*    gpod_track_album(Itdb_Track *t);
+const char*    gpod_track_ipod_path(Itdb_Track *t);
 int            gpod_playlist_count(Itdb_iTunesDB *db);
 Itdb_Playlist* gpod_playlist_at(Itdb_iTunesDB *db, int idx);
 const char*    gpod_playlist_name(Itdb_Playlist *pl);
@@ -357,6 +366,8 @@ def ensure_gpod_available() -> bool:
         return False
 
     try:
+        import importlib
+        importlib.invalidate_caches()
         import _gpod_cffi as _m
         ffi = _m.ffi
         lib = _m.lib
@@ -522,4 +533,17 @@ class IpodDatabase:
             artist = ffi.string(lib.gpod_track_artist(t)).decode(errors="replace")
             title  = ffi.string(lib.gpod_track_title(t)).decode(errors="replace")
             result[(artist, title)] = t
+        return result
+
+    def ipod_paths(self) -> list[str]:
+        """Return each track's on-device path ("/iPod_Control/Music/F12/XXXX.m4a")."""
+        result = []
+        n = lib.gpod_track_count(self._db)
+        for i in range(n):
+            t = lib.gpod_track_at(self._db, i)
+            if t == ffi.NULL:
+                continue
+            raw = ffi.string(lib.gpod_track_ipod_path(t)).decode(errors="replace")
+            if raw:
+                result.append(raw.replace(":", "/"))
         return result
