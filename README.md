@@ -8,7 +8,7 @@ Each run makes the iPod mirror your library:
 1. Detects your iPod — or lists unmounted USB partitions and mounts the one you pick.
 2. Signs in to Apple Music (first run opens a browser window to log in; cookies are cached).
 3. Fetches every song in your library and compares against what's on the iPod.
-4. Downloads only the missing tracks (staged in `tmp/`, deleted after copying).
+4. Downloads only the missing tracks (kept in `cache/` and reused on later syncs instead of re-downloading).
 5. Copies them to the iPod and removes tracks no longer in your library.
 6. If everything succeeded, unmounts and powers off the iPod — safe to unplug.
 
@@ -29,9 +29,10 @@ uv run playwright install chromium
 ## Usage
 
 ```sh
-uv run ipod-sync            # full sync
-uv run ipod-sync --dry-run  # show what would change, touch nothing
-uv run ipod-sync --relogin  # force a fresh Apple Music browser login
+uv run ipod-sync                  # full sync
+uv run ipod-sync --dry-run        # show what would change, touch nothing
+uv run ipod-sync --relogin        # force a fresh Apple Music browser login
+uv run ipod-sync --clean-orphans  # delete files iTunesDB doesn't reference
 ```
 
 State lives in `~/.apple-music-manager/` (cookies, tag-alias map, compiled

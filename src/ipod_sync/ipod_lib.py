@@ -4,6 +4,7 @@ ipod_lib.py — libgpod wrapper via cffi API mode.
 Builds _gpod_cffi.so on first call to ensure_gpod_available().
 Requires libgpod to be installed (pacman -S libgpod).
 """
+import hashlib
 import os
 import shlex
 import subprocess
@@ -19,11 +20,27 @@ _C_SOURCE = r"""
 #include <sys/statvfs.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 static char _last_err[4096];
 
 const char* gpod_last_error(void)  { return _last_err; }
 void        gpod_clear_error(void) { _last_err[0] = 0; }
+
+/* Create a fresh blank iTunesDB plus the iPod_Control directory structure.
+   Model number is read from iPod_Control/Device/SysInfo (ModelNumStr).
+   Needed after a restore/reformat wipes the DB. */
+int gpod_init_ipod(const char *mountpoint, const char *name) {
+    GError *e = NULL;
+    if (!itdb_init_ipod(mountpoint, NULL, name, &e)) {
+        snprintf(_last_err, sizeof _last_err, "%s",
+                 e ? e->message : "itdb_init_ipod failed");
+        if (e) g_error_free(e);
+        return 0;
+    }
+    _last_err[0] = 0;
+    return 1;
+}
 
 Itdb_iTunesDB* gpod_open(const char *mountpoint) {
     GError *e = NULL;
@@ -91,9 +108,10 @@ Itdb_Track* gpod_find_track(Itdb_iTunesDB *db, const char *artist, const char *t
     return NULL;
 }
 
-/* Add a track: copies src file to iPod and registers in iTunesDB.
-   Track is also added to the master playlist automatically.
-   Returns the new Itdb_Track* or NULL on failure (check gpod_last_error). */
+/* Add a track: copies src file to iPod's standard iPod_Control/Music tree and
+   registers it in iTunesDB.  Track is also added to the master playlist
+   automatically.  Returns the new Itdb_Track* or NULL on failure (check
+   gpod_last_error). */
 Itdb_Track* gpod_add_track(Itdb_iTunesDB *db, const char *src,
                             const char *title,       const char *artist,
                             const char *album,       const char *genre,
@@ -134,6 +152,48 @@ Itdb_Track* gpod_add_track(Itdb_iTunesDB *db, const char *src,
     }
     _last_err[0] = 0;
     return t;
+}
+
+/* Repair a track whose ipod_path points outside iPod_Control/Music: renames
+   the file already on the device (same filesystem, no re-copy) into the
+   standard location and repoints the track.  Returns 1 on success, 0 on
+   failure (check gpod_last_error). */
+int gpod_repair_track(Itdb_Track *t, const char *mountpoint, const char *old_abs_path) {
+    GError *e = NULL;
+
+    /* itdb_cp_get_dest_filename() only allocates a fresh F##/ slot when
+       ipod_path is unset -- otherwise it just echoes back the track's
+       current (stray) location, making the rename below a no-op. */
+    g_free(t->ipod_path);
+    t->ipod_path = NULL;
+
+    gchar *dest = itdb_cp_get_dest_filename(t, mountpoint, old_abs_path, &e);
+    if (!dest) {
+        snprintf(_last_err, sizeof _last_err, "%s",
+                 e ? e->message : "itdb_cp_get_dest_filename failed");
+        if (e) g_error_free(e);
+        return 0;
+    }
+
+    gchar *dest_dir = g_path_get_dirname(dest);
+    g_mkdir_with_parents(dest_dir, 0755);
+    g_free(dest_dir);
+
+    if (rename(old_abs_path, dest) != 0) {
+        snprintf(_last_err, sizeof _last_err, "rename failed: %s", strerror(errno));
+        g_free(dest);
+        return 0;
+    }
+
+    Itdb_Track *res = itdb_cp_finalize(t, mountpoint, dest, &e);
+    g_free(dest);
+    if (!res) {
+        snprintf(_last_err, sizeof _last_err, "%s",
+                 e ? e->message : "itdb_cp_finalize failed");
+        if (e) g_error_free(e);
+        return 0;
+    }
+    return 1;
 }
 
 /* Get or create a named playlist (non-smart). */
@@ -268,6 +328,7 @@ typedef struct _Itdb_Playlist Itdb_Playlist;
 
 const char*    gpod_last_error(void);
 void           gpod_clear_error(void);
+int            gpod_init_ipod(const char *mountpoint, const char *name);
 Itdb_iTunesDB* gpod_open(const char *mountpoint);
 int            gpod_save(Itdb_iTunesDB *db);
 void           itdb_free(Itdb_iTunesDB *db);
@@ -283,6 +344,7 @@ Itdb_Track*    gpod_add_track(Itdb_iTunesDB *db, const char *src,
                                const char *composer, const char *albumartist,
                                int size, int tracklen, int track_nr,
                                int bitrate, int samplerate, int year);
+int            gpod_repair_track(Itdb_Track *t, const char *mountpoint, const char *old_abs_path);
 Itdb_Playlist* gpod_ensure_playlist(Itdb_iTunesDB *db, const char *name);
 void           gpod_playlist_add_track(Itdb_Playlist *pl, Itdb_Track *track);
 void           gpod_playlist_clear(Itdb_Playlist *pl);
@@ -301,6 +363,10 @@ void           gpod_remove_playlist(Itdb_iTunesDB *db, Itdb_Playlist *pl);
 """
 
 # ── module-level state ────────────────────────────────────────────────────────
+
+# The module name embeds a hash of the C source, so editing _C_SOURCE/_CDEF
+# automatically invalidates the cached .so and triggers a rebuild.
+_MODULE = "_gpod_cffi_" + hashlib.sha1((_C_SOURCE + _CDEF).encode()).hexdigest()[:10]
 
 ffi = None
 lib = None
@@ -329,13 +395,15 @@ def ensure_gpod_available() -> bool:
     if _GPOD_AVAILABLE:
         return True
 
+    import importlib
+
     # Ensure build dir is on sys.path before trying to import.
     if str(_BUILD_DIR) not in sys.path:
         sys.path.insert(0, str(_BUILD_DIR))
 
-    # Fast path: already compiled from a previous run.
+    # Fast path: already compiled from a previous run of this exact source.
     try:
-        import _gpod_cffi as _m
+        _m = importlib.import_module(_MODULE)
         ffi = _m.ffi
         lib = _m.lib
         _GPOD_AVAILABLE = True
@@ -343,14 +411,14 @@ def ensure_gpod_available() -> bool:
     except ImportError:
         pass
 
-    # Compile now (first run).
+    # Compile now (first run, or the C source changed).
     print("Building libgpod extension (first time only)…", flush=True)
     try:
         from cffi import FFI as _FFI
         _ffi = _FFI()
         cflags, libraries, lib_dirs = _get_pkg_config()
         _ffi.set_source(
-            "_gpod_cffi",
+            _MODULE,
             _C_SOURCE,
             libraries=libraries,
             library_dirs=lib_dirs,
@@ -359,6 +427,9 @@ def ensure_gpod_available() -> bool:
         _ffi.cdef(_CDEF)
         _BUILD_DIR.mkdir(parents=True, exist_ok=True)
         _ffi.compile(tmpdir=str(_BUILD_DIR), verbose=False)
+        for stale in _BUILD_DIR.glob("_gpod_cffi*"):
+            if stale.is_file() and not stale.name.startswith(_MODULE):
+                stale.unlink(missing_ok=True)
         print("Build complete.", flush=True)
     except Exception as e:
         _GPOD_ERROR = str(e)
@@ -366,9 +437,8 @@ def ensure_gpod_available() -> bool:
         return False
 
     try:
-        import importlib
         importlib.invalidate_caches()
-        import _gpod_cffi as _m
+        _m = importlib.import_module(_MODULE)
         ffi = _m.ffi
         lib = _m.lib
         _GPOD_AVAILABLE = True
@@ -379,6 +449,7 @@ def ensure_gpod_available() -> bool:
 
 
 # ── high-level Python class ───────────────────────────────────────────────────
+
 
 class IpodDatabase:
     """Context manager for an iPod's iTunesDB."""
@@ -393,6 +464,13 @@ class IpodDatabase:
         if not _GPOD_AVAILABLE:
             raise RuntimeError(f"libgpod not available: {_GPOD_ERROR}")
         self._fix_otg_playlist()
+        itunes_db = Path(self.mountpoint) / "iPod_Control" / "iTunes" / "iTunesDB"
+        if not itunes_db.exists():
+            # A restore/reformat can wipe the database.
+            print("No iTunesDB on device — initializing a fresh one…", flush=True)
+            if not lib.gpod_init_ipod(self.mountpoint.encode(), b"iPod"):
+                err = ffi.string(lib.gpod_last_error()).decode(errors="replace")
+                raise RuntimeError(f"Failed to initialize iPod at {self.mountpoint!r}: {err}")
         db = lib.gpod_open(self.mountpoint.encode())
         if db == ffi.NULL:
             err = ffi.string(lib.gpod_last_error()).decode(errors="replace")
@@ -484,6 +562,35 @@ class IpodDatabase:
             err = ffi.string(lib.gpod_last_error()).decode(errors="replace")
             raise RuntimeError(err)
         return t
+
+    def repair_layout(self, on_progress=None) -> tuple[int, list[str]]:
+        """Move any track whose ipod_path isn't under iPod_Control/Music back
+        into the standard tree (same filesystem, no re-download) and repoint
+        iTunesDB. Returns (tracks repaired, error messages)."""
+        n = lib.gpod_track_count(self._db)
+        targets = []
+        for i in range(n):
+            t = lib.gpod_track_at(self._db, i)
+            if t == ffi.NULL:
+                continue
+            raw = ffi.string(lib.gpod_track_ipod_path(t)).decode(errors="replace")
+            slash = raw.replace(":", "/")
+            if slash and not slash.casefold().startswith("/ipod_control/music/"):
+                targets.append((t, slash))
+
+        repaired = 0
+        errors = []
+        for i, (t, slash) in enumerate(targets):
+            old = Path(self.mountpoint) / slash.lstrip("/")
+            if old.is_file():
+                if lib.gpod_repair_track(t, self.mountpoint.encode(), str(old).encode("utf-8")):
+                    repaired += 1
+                else:
+                    err = ffi.string(lib.gpod_last_error()).decode(errors="replace")
+                    errors.append(f"{slash}: {err}")
+            if on_progress:
+                on_progress(i + 1, len(targets))
+        return repaired, errors
 
     # ── playlist operations ───────────────────────────────────────────────────
 

@@ -12,3 +12,4 @@ wheels/
 # Secrets and staging
 cookies.txt
 tmp/
+cache/

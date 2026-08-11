@@ -151,3 +151,19 @@ def find_orphans(db, mountpoint: str) -> tuple[list[Path], int]:
                 orphans.append(f)
                 total_bytes += f.stat().st_size
     return orphans, total_bytes
+
+
+def prune_empty_dirs(mountpoint: str) -> None:
+    music = Path(mountpoint) / "Music"
+    if not music.is_dir():
+        return
+    dirs = sorted(
+        (d for d in music.rglob("*") if d.is_dir()),
+        key=lambda d: len(d.parts),
+        reverse=True,
+    )
+    for d in dirs:
+        try:
+            d.rmdir()
+        except OSError:
+            pass

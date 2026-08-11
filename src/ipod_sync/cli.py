@@ -15,11 +15,20 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from . import STAGING_DIR
+from . import CACHE_DIR, STAGING_DIR
 from . import apple_music, device
 from .auth import AuthError, ensure_cookies
 from .ipod_lib import IpodDatabase, ensure_gpod_available
-from .sync import Aliases, Counters, clean_staging, diff, find_orphans, read_audio_meta, track_key
+from .sync import (
+    Aliases,
+    Counters,
+    clean_staging,
+    diff,
+    find_orphans,
+    prune_empty_dirs,
+    read_audio_meta,
+    track_key,
+)
 
 console = Console()
 
@@ -72,33 +81,32 @@ async def _network_phase(
     return missing, stale, downloaded
 
 
-def _scan_staging() -> dict:
-    staged = {}
-    music = STAGING_DIR / "music"
-    if music.exists():
-        for path in list(music.rglob("*.m4a")) + list(music.rglob("*.mp4")):
+def _scan_cache() -> dict:
+    cached = {}
+    if CACHE_DIR.exists():
+        for path in list(CACHE_DIR.rglob("*.m4a")) + list(CACHE_DIR.rglob("*.mp4")):
             meta = read_audio_meta(path)
             if meta:
-                staged[track_key(meta["artist"], meta["title"])] = path
-    return staged
+                cached[track_key(meta["artist"], meta["title"])] = path
+    return cached
 
 
 async def _download_missing(api, missing, aliases, counters: Counters, jobs: int) -> list[tuple]:
-    dl = apple_music.build_downloader(api, STAGING_DIR / "music", STAGING_DIR)
+    dl = apple_music.build_downloader(api, CACHE_DIR, STAGING_DIR)
     downloaded = []
     semaphore = asyncio.Semaphore(jobs)
 
-    staged = _scan_staging()
+    cached = _scan_cache()
     pending = []
     for song in missing:
-        path = staged.get(aliases.key_for(song))
+        path = cached.get(aliases.key_for(song))
         if path:
             downloaded.append((song, path))
             counters.downloaded += 1
         else:
             pending.append(song)
     if downloaded:
-        console.print(f"{len(downloaded)} tracks already staged — reusing without download")
+        console.print(f"{len(downloaded)} tracks already cached — reusing without download")
     if not pending:
         return downloaded
 
@@ -173,7 +181,6 @@ def _write_ipod(mountpoint, stale, downloaded, aliases, counters: Counters) -> N
                         progress.console.print(f"  [red]✗ remove {key}: {e}[/red]")
                     progress.advance(task)
 
-        added_paths: list = []
         if downloaded:
             with _progress() as progress:
                 task = progress.add_task("Copying to iPod", total=len(downloaded))
@@ -188,7 +195,6 @@ def _write_ipod(mountpoint, stale, downloaded, aliases, counters: Counters) -> N
                         db.add_track(str(path), meta)
                         aliases.record(song, track_key(meta["artist"], meta["title"]))
                         counters.added += 1
-                        added_paths.append(path)
                     except Exception as e:
                         counters.add_failed += 1
                         progress.console.print(
@@ -205,8 +211,7 @@ def _write_ipod(mountpoint, stale, downloaded, aliases, counters: Counters) -> N
             console.print(f"[red]Failed to write iTunesDB: {e}[/red]")
         else:
             console.print("iPod database saved.")
-            for path in added_paths:
-                path.unlink(missing_ok=True)
+    prune_empty_dirs(mountpoint)
 
 
 def _summary(counters: Counters) -> None:
@@ -258,6 +263,16 @@ def main(dry_run: bool, relogin: bool, jobs: int, clean_orphans: bool) -> None:
     aliases = Aliases.load()
     with IpodDatabase(mountpoint) as db:
         console.print(f"Device: {db.device_name}")
+        if not dry_run:
+            with console.status("Checking track layout…"):
+                repaired, repair_errors = db.repair_layout()
+            if repaired:
+                with console.status("Saving iPod database…"):
+                    db.save()
+                prune_empty_dirs(mountpoint)
+                console.print(f"Repaired {repaired} tracks back into iPod_Control/Music")
+            for err in repair_errors:
+                console.print(f"  [red]✗ repair {err}[/red]")
         ipod_keys = {track_key(a, t) for (a, t) in db.build_track_map().keys()}
         if clean_orphans:
             with console.status("Scanning for orphaned files…"):
@@ -276,6 +291,7 @@ def main(dry_run: bool, relogin: bool, jobs: int, clean_orphans: bool) -> None:
                 for f in orphans:
                     f.unlink(missing_ok=True)
                     progress.advance(task)
+            prune_empty_dirs(mountpoint)
             console.print(
                 f"Deleted {len(orphans)} orphaned files — freed {orphan_bytes / 1e9:.1f} GB"
             )
@@ -327,7 +343,7 @@ def main(dry_run: bool, relogin: bool, jobs: int, clean_orphans: bool) -> None:
     else:
         console.print(
             f"[red]{counters.total_errors} errors — device left mounted; "
-            "staged files kept for retry on next run.[/red]"
+            "downloads cached for retry on next run.[/red]"
         )
         sys.exit(1)
 

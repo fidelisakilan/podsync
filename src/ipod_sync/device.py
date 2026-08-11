@@ -81,6 +81,24 @@ def device_for_mount(mountpoint: str) -> str | None:
     return out.stdout.strip() or None
 
 
+def is_read_only(mountpoint: str) -> bool:
+    return bool(os.statvfs(mountpoint).f_flag & os.ST_RDONLY)
+
+
+def print_read_only_hint(mountpoint: str, console: Console) -> None:
+    dev = device_for_mount(mountpoint) or "the device"
+    console.print(f"[red]{mountpoint} is mounted read-only.[/red]")
+    console.print(
+        "Journaled HFS+ volumes mount read-only on Linux unless forced:\n"
+        f"  udisksctl unmount -b {dev}\n"
+        "  sudo mkdir -p /mnt/ipod\n"
+        f"  sudo mount -t hfsplus -o rw,force,uid=$(id -u),gid=$(id -g) {dev} /mnt/ipod\n"
+        "Then rerun ipod-sync.\n"
+        "To avoid this every time, disable HFS+ journaling on the iPod from a Mac:\n"
+        "  diskutil disableJournal /Volumes/iPod"
+    )
+
+
 def eject(dev: str, console: Console) -> bool:
     os.sync()
     out = subprocess.run(
@@ -102,6 +120,9 @@ def prompt_and_mount(console: Console) -> str | None:
     while True:
         mountpoint = find_ipod_mount()
         if mountpoint:
+            if is_read_only(mountpoint):
+                print_read_only_hint(mountpoint, console)
+                return None
             return mountpoint
 
         candidates = list_candidates()
@@ -142,6 +163,9 @@ def prompt_and_mount(console: Console) -> str | None:
             console.print(f"[red]Mount failed: {e}[/red]")
             continue
         if (Path(mountpoint) / "iPod_Control").exists():
+            if is_read_only(mountpoint):
+                print_read_only_hint(mountpoint, console)
+                return None
             console.print(f"Mounted {dev} at {mountpoint}")
             return mountpoint
         console.print(
