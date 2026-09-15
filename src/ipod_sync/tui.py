@@ -65,28 +65,43 @@ _COMMAND_MAP = {
     "clean-orphans": lambda ui, session, p: clean_orphans(ui, session, yes=p["yes"]),
 }
 
-_COLUMN_LABELS = ("Song", "Album", "Origin")
-_ORIGIN_WIDTH = 6
+_COLUMN_LABELS = ("Song", "Album")
+
+# Manually `add`ed tracks (as opposed to ones a sync brought in) are picked
+# out by colour instead of a dedicated column.
+ADDED_STYLE = "bold cyan"
+ADDED_LEGEND = "[bold cyan]cyan[/bold cyan] = added manually"
 
 
 def _column_widths(table_width: int) -> list[int]:
     """Split the visible table width between the columns so nothing ever
-    needs a horizontal scrollbar: Origin is fixed, the rest goes 60/40."""
+    needs a horizontal scrollbar."""
     padding = 2 * len(_COLUMN_LABELS)  # DataTable pads each cell by 1 on both sides
     scrollbar = 2
-    rest = max(16, table_width - scrollbar - padding - _ORIGIN_WIDTH)
+    rest = max(16, table_width - scrollbar - padding)
     song = max(8, rest * 60 // 100)
     album = max(8, rest - song)
-    return [song, album, _ORIGIN_WIDTH]
+    return [song, album]
 
 
 def _one_line(text: str, width: int) -> str:
     return text if len(text) <= width else text[: max(0, width - 1)] + "…"
 
 
-def _song_cell(title: str, artist: str, width: int) -> Text:
-    """Title on the first line, artist dimmed on the second."""
-    return Text.assemble(_one_line(title, width), "\n", (_one_line(artist, width), "dim"))
+def _song_cell(title: str, artist: str, width: int, added: bool) -> Text:
+    """Title on the first line, artist dimmed on the second; both coloured
+    when the track was added manually rather than by a sync."""
+    style = ADDED_STYLE if added else ""
+    return Text.assemble(
+        (_one_line(title, width), style),
+        "\n",
+        (_one_line(artist, width), f"dim {style}".strip() if added else "dim"),
+    )
+
+
+def _album_cell(album: str, width: int, added: bool) -> Text:
+    lines, _ = _wrap_cell(album, width)
+    return Text(lines, style=ADDED_STYLE if added else "")
 
 
 ROW_LINES = 2  # every row is two lines tall so wrapping is uniform
@@ -202,19 +217,59 @@ class LogModal(ModalScreen):
             w.write(line)
 
 
+class PlaylistChooser(ModalScreen[int | None]):
+    """Floating, centred chooser for the current playlist (Esc from the
+    track table opens this instead of a permanent side pane)."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("enter", "confirm", "Select"),
+    ]
+
+    def __init__(self, playlists: list[str], current: int) -> None:
+        super().__init__()
+        self._playlists = playlists
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="chooser-box"):
+            yield Label("Playlists  (j/k move · enter select · esc cancel)", id="chooser-title")
+            yield ListView(id="chooser-list")
+
+    async def on_mount(self) -> None:
+        lv = self.query_one("#chooser-list", ListView)
+        for name in self._playlists:
+            await lv.append(ListItem(Static(name)))
+        lv.index = self._current
+        lv.focus()
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#chooser-list", ListView).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#chooser-list", ListView).action_cursor_up()
+
+    def action_confirm(self) -> None:
+        self.dismiss(self.query_one("#chooser-list", ListView).index)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss(event.list_view.index)
+
+
 class IpodSyncApp(App):
     ENABLE_COMMAND_PALETTE = False
 
     CSS = """
     Screen { layout: vertical; }
-    #panels { layout: horizontal; height: 1fr; }
-    #left { width: 30; height: 1fr; border-right: solid $panel; }
-    #right { width: 1fr; height: 1fr; }
-    #left-header, #right-header {
+    #header {
         height: 1; background: $surface; color: $text-muted;
         text-style: bold; padding: 0 1;
     }
-    #playlist-list { height: 1fr; }
     #track-table { height: 1fr; }
     #status-line { height: 1; padding: 0 1; border-top: solid $foreground 20%; }
     #log-pane { height: 10; border-top: solid $foreground 20%; }
@@ -236,37 +291,36 @@ class IpodSyncApp(App):
     Header { color: $foreground; text-style: bold; }
     FooterKey .footer-key--key { color: $foreground; text-style: bold; background: transparent; }
     FooterKey .footer-key--description { color: $foreground 60%; background: transparent; }
-    #left-header, #right-header { color: $foreground 60%; text-style: bold; background: transparent; padding: 0 1; }
+    #header { color: $foreground 60%; text-style: bold; background: transparent; padding: 0 1; }
     ListView, ListItem { background: transparent; }
-    ListView > ListItem.--highlight { background: transparent; }
-    ListView > ListItem.--highlight Static { text-style: reverse; }
-    ListView:focus > ListItem.--highlight Static { text-style: bold reverse; }
     DataTable { background: transparent; }
     DataTable > .datatable--header { background: transparent; color: $foreground 60%; text-style: bold; }
-    DataTable > .datatable--cursor { background: transparent; text-style: reverse; }
-    DataTable:focus > .datatable--cursor { background: transparent; text-style: bold reverse; }
     DataTable > .datatable--hover { background: transparent; }
+    /* .datatable--cursor and ListItem's highlighted state are left to
+       Textual's own defaults: a real filled tile using the block-cursor
+       tokens (ansi_magenta under ansi_color=True), not a hardcoded hex. */
     #cmdline { background: transparent; border: none; padding: 0 1; }
     #cmdline:focus { border: none; }
     #track-table { overflow-x: hidden; }
     #cmdline { height: 1; border-top: solid $panel; }
     #cmdline.-hidden { display: none; }
 
-    MountModal, LogModal, ConfirmModal, PickModal, StartupScreen { align: center middle; }
+    MountModal, LogModal, ConfirmModal, PickModal, StartupScreen, PlaylistChooser { align: center middle; }
     StartupScreen { background: transparent; }
     #startup-box { width: 44; height: 7; border: round $foreground 40%; background: transparent; align: center middle; }
     #startup-spinner { height: 1; color: $foreground 70%; background: transparent; }
     #startup-phase { width: 100%; content-align: center middle; color: $foreground 70%; background: transparent; }
-    #mount-box, #log-modal-box, #confirm-box, #pick-box {
+    #mount-box, #log-modal-box, #confirm-box, #pick-box, #chooser-box {
         width: 80%; height: auto; max-height: 80%;
         border: solid $accent; background: $surface; padding: 1 2;
     }
     #log-modal-content { height: 30; }
     #pick-table { height: 20; }
+    #chooser-box { width: 44; max-height: 70%; }
+    #chooser-list { height: auto; max-height: 20; }
     """
 
     BINDINGS = [
-        Binding("tab", "switch_panel", "Switch", show=False),
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
         Binding("g", "g_key", "Top", show=False),
@@ -281,6 +335,7 @@ class IpodSyncApp(App):
         Binding("e", "shortcut_eject", "eject", show=True),
         Binding("x", "cancel_worker", "cancel", show=True),
         Binding("grave", "toggle_log", "log", show=True, key_display="`"),
+        Binding("L", "toggle_log", "log", show=False),
         Binding("q", "request_quit", "quit", show=True),
         Binding("ctrl+c", "request_quit", "quit", show=False, priority=True),
         Binding("escape", "close_cmdline", "close", show=False),
@@ -303,24 +358,20 @@ class IpodSyncApp(App):
         self._spinner_frame = 0
         self._spinner_timer = None
         self._current_future: concurrent.futures.Future | None = None
+        self._last_outcome = ""
 
     # ── layout ───────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="panels"):
-            with Vertical(id="left"):
-                yield Label("Playlists", id="left-header")
-                yield ListView(id="playlist-list")
-            with Vertical(id="right"):
-                yield Label("Tracks", id="right-header")
-                yield DataTable(id="track-table", cursor_type="row")
+        yield Label("", id="header")
+        yield DataTable(id="track-table", cursor_type="row")
         yield Static("", id="status-line", markup=True)
         yield RichLog(id="log-pane", markup=True, classes="-hidden")
         yield Input(placeholder="", id="cmdline", classes="-hidden")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#playlist-list", ListView).focus()
+        self.query_one("#track-table", DataTable).focus()
         self._start()
 
     # ── UI plumbing used by ui.TextualUI ────────────────────────────────────
@@ -351,7 +402,20 @@ class IpodSyncApp(App):
             self._spinner_timer = None
         self._activity = None
         elapsed = self._fmt_elapsed()
-        self.query_one("#status-line", Static).update(f"{text} [dim]({elapsed})[/dim]")
+        self._last_outcome = f"{text} [dim]({elapsed})[/dim]"
+        self.query_one("#status-line", Static).update(self._last_outcome)
+
+    def _flash(self, text: str, seconds: float = 3.0) -> None:
+        """Show `text` on the always-visible status line even when nothing
+        is "running" and the log pane is hidden — so a command that fails
+        before it even starts (bad syntax, unknown name, already busy) is
+        never silently visible only in the log."""
+        self.query_one("#status-line", Static).update(text)
+        if not self._activity:
+            self.set_timer(
+                seconds,
+                lambda: self.query_one("#status-line", Static).update(self._last_outcome),
+            )
 
     def _tick_status(self) -> None:
         self._spinner_frame = (self._spinner_frame + 1) % len(self._SPINNER)
@@ -441,23 +505,10 @@ class IpodSyncApp(App):
             if n not in (FAVOURITES_PLAYLIST, RECENT_PLAYLIST):
                 self._playlists.append(n)
 
-        lv = self.query_one("#playlist-list", ListView)
-        await lv.clear()
-        for name in self._playlists:
-            await lv.append(ListItem(Static(name)))
-        lv.index = 0
         self._current_playlist = 0
         self._load_table(0)
 
     # ── track table ──────────────────────────────────────────────────────────
-
-    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.list_view.id != "playlist-list":
-            return
-        idx = event.list_view.index
-        if idx is not None:
-            self._current_playlist = idx
-            self._load_table(idx)
 
     def _load_table(self, idx: int) -> None:
         table = self.query_one("#track-table", DataTable)
@@ -465,7 +516,7 @@ class IpodSyncApp(App):
         widths = _column_widths(table.size.width or 100)
         for label, width in zip(_COLUMN_LABELS, widths):
             table.add_column(label, width=width)
-        header = self.query_one("#right-header", Label)
+        header = self.query_one("#header", Label)
         if not self.session or idx >= len(self._playlists):
             return
         name = self._playlists[idx]
@@ -474,14 +525,17 @@ class IpodSyncApp(App):
             member_paths = self._members_cache.get(name, set())
             rows = [t for t in rows if t.ipod_path in member_paths]
         suffix = f"  /{self._filter}" if self._filter else ""
-        header.update(f"{name} ({len(rows)}){suffix}")
+        header.update(f"{name} ({len(rows)}){suffix}  ·  {ADDED_LEGEND}")
         needle = self._filter.casefold()
         for t in rows:
             if needle and needle not in f"{t.artist} {t.title} {t.album}".casefold():
                 continue
-            origin = self.session.origins.get(t.ipod_path)
-            album, _ = _wrap_cell(t.album, widths[1])
-            table.add_row(_song_cell(t.title, t.artist, widths[0]), album, origin, height=ROW_LINES)
+            added = self.session.origins.get(t.ipod_path) == "add"
+            table.add_row(
+                _song_cell(t.title, t.artist, widths[0], added),
+                _album_cell(t.album, widths[1], added),
+                height=ROW_LINES,
+            )
 
     def on_resize(self, event: events.Resize) -> None:
         timer = getattr(self, "_resize_timer", None)
@@ -492,12 +546,6 @@ class IpodSyncApp(App):
         )
 
     # ── vim-ish navigation ───────────────────────────────────────────────────
-
-    def action_switch_panel(self) -> None:
-        if isinstance(self.focused, DataTable):
-            self.query_one("#playlist-list", ListView).focus()
-        else:
-            self.query_one("#track-table", DataTable).focus()
 
     def action_cursor_down(self) -> None:
         f = self.focused
@@ -562,13 +610,18 @@ class IpodSyncApp(App):
             inp.value = ""
             self.query_one("#track-table", DataTable).focus()
         elif isinstance(self.focused, DataTable):
-            # Escape in the track list goes back to the playlist pane.
-            self.query_one("#playlist-list", ListView).focus()
+            # Escape on the track table opens the floating playlist chooser.
+            self._open_playlist_chooser()
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        # Enter on a playlist opens its tracks.
-        if event.list_view.id == "playlist-list":
-            self.query_one("#track-table", DataTable).focus()
+    @work(exclusive=True)
+    async def _open_playlist_chooser(self) -> None:
+        choice = await self.push_screen_wait(
+            PlaylistChooser(self._playlists, self._current_playlist)
+        )
+        if choice is not None and choice != self._current_playlist:
+            self._current_playlist = choice
+            self._load_table(choice)
+        self.query_one("#track-table", DataTable).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value
@@ -590,6 +643,7 @@ class IpodSyncApp(App):
             parts = shlex.split(line)
         except ValueError as e:
             self.log_line(f"[red]parse error: {e}[/red]")
+            self._flash(f"[red]✗ parse error: {e}[/red]")
             return
         if not parts:
             return
@@ -604,21 +658,26 @@ class IpodSyncApp(App):
         cmd = cli_module.main.commands.get(name)
         if cmd is None:
             self.log_line(f"[red]unknown command: {name}[/red]")
+            self._flash(f"[red]✗ unknown command: {name}[/red]")
             return
         try:
             ctx = cmd.make_context(name, list(args))
         except click.UsageError as e:
             self.log_line(f"[red]{e}[/red]")
+            self._flash(f"[red]✗ {e}[/red]")
             return
         handler = _COMMAND_MAP.get(name)
         if handler is None:
             self.log_line(f"[red]not available in the TUI: {name}[/red]")
+            self._flash(f"[red]✗ not available in the TUI: {name}[/red]")
             return
         if name not in _NO_SESSION_NEEDED and not self.session:
             self.log_line("Not ready yet — still connecting.")
+            self._flash("[yellow]Not ready yet — still connecting.[/yellow]")
             return
         if self._current_future and not self._current_future.done():
             self.log_line("[yellow]A command is still running — press x to cancel it first.[/yellow]")
+            self._flash("[yellow]A command is still running — press x to cancel it.[/yellow]")
             return
         self._launch_command(name, handler, ctx.params)
 

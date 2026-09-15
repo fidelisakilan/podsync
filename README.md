@@ -31,9 +31,10 @@ uv run playwright install chromium
 uv run ipod-sync
 ```
 
-Opens the iPod, signs in, and shows a two-pane view: playlists on the left,
-the **iPod's actual contents** (not the Apple Music library — that's instant)
-on the right, with an `Origin` column (`sync` or `add`, see below).
+Opens the iPod, signs in, and shows a full-width table of the **iPod's
+actual contents** (not the Apple Music library — that's instant). Manually
+`add`ed tracks (as opposed to ones a sync brought in, see below) are shown in
+cyan instead of a separate column.
 
 Keys:
 
@@ -42,8 +43,7 @@ Keys:
 | `j` / `k` | move down / up |
 | `gg` / `G` | jump to top / bottom |
 | `Ctrl-f` / `Ctrl-b` | page down / up |
-| `Tab` | switch between the playlist and track panes |
-| `Enter` / `Esc` | open the selected playlist's tracks / go back to the playlist pane |
+| `Esc` | open a floating chooser for the playlist to view (All tracks / Favourites / Recently Added / …) — `j`/`k` and `Enter` to pick, `Esc` to cancel |
 | `/` | filter the track table |
 | `:` | open the command line (`shlex`-split, same commands as the CLI) |
 | `a` | opens `:add ` for you to type a query or URL |
