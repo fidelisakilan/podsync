@@ -12,6 +12,8 @@ dependencies = [
     "mutagen>=1.47.0",
     "playwright>=1.40",
     "setuptools>=82.0.1",
+    "textual>=0.60",
+    "yt-dlp>=2024.0.0",
 ]
 
 [project.scripts]

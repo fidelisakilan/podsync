@@ -5,8 +5,13 @@ from pathlib import Path
 
 from . import APP_DIR, STAGING_DIR
 from .apple_music import LibrarySong
+from .ipod_lib import TrackInfo
+from .origins import Origins
 
 STATE_PATH = APP_DIR / "state.json"
+
+RECENT_PLAYLIST = "Recently Added"
+FAVOURITES_PLAYLIST = "Favourites"
 
 Key = tuple[str, str]
 
@@ -130,6 +135,46 @@ def diff(
     known_unavailable = sum(1 for s in songs if s.catalog_id in aliases.unavailable)
     stale = ipod_keys - wanted
     return missing, stale, known_unavailable
+
+
+@dataclass
+class SyncPlan:
+    missing: list[LibrarySong]
+    to_delete: list[TrackInfo]
+    known_unavailable: int
+
+
+def plan_sync(
+    songs: list[LibrarySong],
+    ipod_tracks: list[TrackInfo],
+    aliases: "Aliases",
+    origins: Origins,
+    hard: bool,
+) -> SyncPlan:
+    """Work out what a sync needs to change.
+
+    `missing`: library songs not yet on the iPod (and not marked unavailable).
+    `to_delete`: iPod tracks no longer in the library — for a soft sync only
+    those whose origin is "sync" (an "add"-origin track is never touched);
+    for a hard sync, every unwanted track regardless of origin.
+    """
+    ipod_keys = {track_key(t.artist, t.title) for t in ipod_tracks}
+    wanted = {aliases.key_for(s) for s in songs}
+
+    missing = [
+        s
+        for s in songs
+        if aliases.key_for(s) not in ipod_keys and s.catalog_id not in aliases.unavailable
+    ]
+    known_unavailable = sum(1 for s in songs if s.catalog_id in aliases.unavailable)
+
+    to_delete = [
+        t
+        for t in ipod_tracks
+        if track_key(t.artist, t.title) not in wanted
+        and (hard or origins.get(t.ipod_path) == "sync")
+    ]
+    return SyncPlan(missing, to_delete, known_unavailable)
 
 
 def clean_staging() -> None:

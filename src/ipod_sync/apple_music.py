@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 from gamdl.api import AppleMusicApi, ItunesApi
+from gamdl.api.constants import AMP_API_URL
 from gamdl.downloader import (
     AppleMusicBaseDownloader,
     AppleMusicDownloader,
@@ -12,6 +13,12 @@ from gamdl.downloader import (
     AppleMusicSongDownloader,
     AppleMusicUploadedVideoDownloader,
     NotStreamable,
+)
+from gamdl.downloader.constants import (
+    ALBUM_MEDIA_TYPE,
+    ARTIST_MEDIA_TYPE,
+    PLAYLIST_MEDIA_TYPE,
+    SONG_MEDIA_TYPE,
 )
 from gamdl.interface import (
     AppleMusicInterface,
@@ -55,6 +62,8 @@ class LibrarySong:
     artist: str
     title: str
     album: str
+    favourite: bool = False
+    duration_ms: int = 0
 
 
 async def create_api(cookies_path: Path) -> AppleMusicApi:
@@ -73,7 +82,8 @@ async def fetch_library_songs(
     api: AppleMusicApi, on_progress: Callable[[int, int], None], jobs: int = 8
 ) -> tuple[list[LibrarySong], int]:
     limit = 100
-    first = await api._amp_request("/v1/me/library/songs", {"limit": limit, "offset": 0})
+    params = {"limit": limit, "offset": 0, "extend": "inFavorites"}
+    first = await api._amp_request("/v1/me/library/songs", params)
     total = first.get("meta", {}).get("total", 0)
     fetched = len(first.get("data", []))
     on_progress(fetched, total)
@@ -86,7 +96,8 @@ async def fetch_library_songs(
             for attempt in (1, 2):
                 try:
                     resp = await api._amp_request(
-                        "/v1/me/library/songs", {"limit": limit, "offset": offset}
+                        "/v1/me/library/songs",
+                        {"limit": limit, "offset": offset, "extend": "inFavorites"},
                     )
                     break
                 except Exception:
@@ -123,6 +134,8 @@ async def fetch_library_songs(
                     artist=attr.get("artistName", ""),
                     title=attr.get("name", ""),
                     album=attr.get("albumName", ""),
+                    favourite=bool(attr.get("inFavorites", False)),
+                    duration_ms=int(attr.get("durationInMillis", 0) or 0),
                 )
             )
     return songs, skipped
@@ -180,3 +193,105 @@ async def download_song(
     if not item.final_path or not Path(item.final_path).exists():
         raise RuntimeError("download produced no file")
     return Path(item.final_path)
+
+
+async def search_songs(
+    api: AppleMusicApi, term: str, limit: int = 5, offset: int = 0
+) -> list[LibrarySong]:
+    """Search the Apple Music catalog for songs matching `term`."""
+    resp = await api.get_search_results(term, types="songs", limit=limit, offset=offset)
+    items = resp.get("results", {}).get("songs", {}).get("data", [])
+    songs = []
+    for item in items:
+        catalog_id = str(item.get("id", ""))
+        if not catalog_id:
+            continue
+        attr = item.get("attributes", {})
+        songs.append(
+            LibrarySong(
+                catalog_id=catalog_id,
+                artist=attr.get("artistName", ""),
+                title=attr.get("name", ""),
+                album=attr.get("albumName", ""),
+                duration_ms=int(attr.get("durationInMillis", 0) or 0),
+            )
+        )
+    return songs
+
+
+async def add_to_library(api: AppleMusicApi, ids: list[str], kind: str = "songs") -> None:
+    """POST catalog ids into the signed-in user's Apple Music library.
+
+    `kind` is "songs" or "albums". Expects HTTP 202; raises otherwise.
+    """
+    if not ids:
+        return
+    resp = await api.client.post(
+        f"{AMP_API_URL}/v1/me/library",
+        params={f"ids[{kind}]": ",".join(ids)},
+        headers={"media-user-token": api.media_user_token or ""},
+    )
+    if resp.status_code != 202:
+        raise RuntimeError(
+            f"add to library failed ({resp.status_code}): {resp.text[:200]}"
+        )
+
+
+class UnsupportedUrlError(ValueError):
+    pass
+
+
+async def resolve_url(
+    api: AppleMusicApi, dl: AppleMusicDownloader, url: str
+) -> tuple[str, list[LibrarySong], str | None]:
+    """Classify an Apple Music URL and fetch its songs.
+
+    Returns (kind, songs, album_id) where kind is one of "song", "album",
+    "playlist". Raises UnsupportedUrlError for artist/other URLs, or if
+    nothing streamable is found.
+    """
+    url_info = dl.get_url_info(url)
+    if url_info is None:
+        raise UnsupportedUrlError("not an Apple Music URL")
+
+    effective_type = "song" if url_info.sub_id else (url_info.type or url_info.library_type)
+    if not effective_type:
+        raise UnsupportedUrlError("could not determine URL type")
+    if effective_type in ARTIST_MEDIA_TYPE:
+        raise UnsupportedUrlError("artist URLs are not supported")
+    if effective_type in SONG_MEDIA_TYPE:
+        kind = "song"
+    elif effective_type in ALBUM_MEDIA_TYPE:
+        kind = "album"
+    elif effective_type in PLAYLIST_MEDIA_TYPE:
+        kind = "playlist"
+    else:
+        raise UnsupportedUrlError(f"unsupported URL type: {effective_type!r}")
+
+    items = await dl.get_download_queue(url_info)
+    if not items:
+        raise UnsupportedUrlError("nothing found at that URL")
+
+    songs: list[LibrarySong] = []
+    for item in items:
+        meta = item.media_metadata or {}
+        if meta.get("type") not in SONG_MEDIA_TYPE:
+            continue
+        catalog_id = str(meta.get("id", ""))
+        if not catalog_id:
+            continue
+        attr = meta.get("attributes", {})
+        songs.append(
+            LibrarySong(
+                catalog_id=catalog_id,
+                artist=attr.get("artistName", ""),
+                title=attr.get("name", ""),
+                album=attr.get("albumName", ""),
+                duration_ms=int(attr.get("durationInMillis", 0) or 0),
+            )
+        )
+    if not songs:
+        raise UnsupportedUrlError("no downloadable songs found at that URL")
+
+    album_id = (url_info.id or url_info.library_id) if kind == "album" else None
+    return kind, songs, album_id

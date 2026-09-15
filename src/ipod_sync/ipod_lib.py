@@ -9,6 +9,7 @@ import os
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 _BUILD_DIR = Path.home() / ".apple-music-manager" / "gpod_build"
@@ -319,6 +320,15 @@ int gpod_playlist_is_mpl(Itdb_Playlist *pl) {
 void gpod_remove_playlist(Itdb_iTunesDB *db, Itdb_Playlist *pl) {
     itdb_playlist_remove(pl);
 }
+
+int gpod_playlist_track_count(Itdb_Playlist *pl) {
+    return (int)g_list_length(pl->members);
+}
+
+Itdb_Track* gpod_playlist_track_at(Itdb_Playlist *pl, int idx) {
+    GList *l = g_list_nth(pl->members, (guint)idx);
+    return l ? (Itdb_Track *)l->data : NULL;
+}
 """
 
 _CDEF = """
@@ -360,6 +370,8 @@ Itdb_Playlist* gpod_playlist_at(Itdb_iTunesDB *db, int idx);
 const char*    gpod_playlist_name(Itdb_Playlist *pl);
 int            gpod_playlist_is_mpl(Itdb_Playlist *pl);
 void           gpod_remove_playlist(Itdb_iTunesDB *db, Itdb_Playlist *pl);
+int            gpod_playlist_track_count(Itdb_Playlist *pl);
+Itdb_Track*    gpod_playlist_track_at(Itdb_Playlist *pl, int idx);
 """
 
 # ── module-level state ────────────────────────────────────────────────────────
@@ -449,6 +461,17 @@ def ensure_gpod_available() -> bool:
 
 
 # ── high-level Python class ───────────────────────────────────────────────────
+
+
+@dataclass
+class TrackInfo:
+    """One iPod track, read via the existing gpod_track_* cdef bindings."""
+
+    artist: str
+    title: str
+    album: str
+    ipod_path: str  # e.g. "/iPod_Control/Music/F12/XXXX.m4a"
+    ptr: object  # opaque Itdb_Track* — pass back into IpodDatabase methods
 
 
 class IpodDatabase:
@@ -641,6 +664,35 @@ class IpodDatabase:
             title  = ffi.string(lib.gpod_track_title(t)).decode(errors="replace")
             result[(artist, title)] = t
         return result
+
+    def tracks(self) -> list[TrackInfo]:
+        """Return every track on the iPod as a TrackInfo (Python-only helper;
+        uses the existing gpod_track_* bindings, no new C code)."""
+        result = []
+        n = lib.gpod_track_count(self._db)
+        for i in range(n):
+            t = lib.gpod_track_at(self._db, i)
+            if t == ffi.NULL:
+                continue
+            artist = ffi.string(lib.gpod_track_artist(t)).decode(errors="replace")
+            title = ffi.string(lib.gpod_track_title(t)).decode(errors="replace")
+            album = ffi.string(lib.gpod_track_album(t)).decode(errors="replace")
+            raw = ffi.string(lib.gpod_track_ipod_path(t)).decode(errors="replace")
+            result.append(TrackInfo(artist, title, album, raw.replace(":", "/"), t))
+        return result
+
+    def playlist_members(self, playlist) -> set[str]:
+        """Return the on-device paths of every track in a playlist, in slash form."""
+        paths = set()
+        n = lib.gpod_playlist_track_count(playlist)
+        for i in range(n):
+            t = lib.gpod_playlist_track_at(playlist, i)
+            if t == ffi.NULL:
+                continue
+            raw = ffi.string(lib.gpod_track_ipod_path(t)).decode(errors="replace")
+            if raw:
+                paths.add(raw.replace(":", "/"))
+        return paths
 
     def ipod_paths(self) -> list[str]:
         """Return each track's on-device path ("/iPod_Control/Music/F12/XXXX.m4a")."""
