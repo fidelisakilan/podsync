@@ -1,5 +1,4 @@
-"""session.py — one open Apple Music + iPod session, reused by every command
-in a single `ipod-sync` invocation (one-shot subcommand or the TUI)."""
+"""session.py — one open Apple Music + iPod session, reused by TUI commands."""
 from __future__ import annotations
 
 import shutil
@@ -44,9 +43,7 @@ class Session:
             ui.print("Warning: ffmpeg not found in PATH")
 
         if mountpoint is None:
-            mountpoint = device.prompt_and_mount(console_for(ui))
-            if not mountpoint:
-                raise SessionError("No iPod — nothing to do.")
+            raise SessionError("No iPod mountpoint provided.")
         dev = device.device_for_mount(mountpoint)
 
         cookies = ensure_cookies(console_for(ui))

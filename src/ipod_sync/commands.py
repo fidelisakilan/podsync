@@ -1,19 +1,17 @@
-"""commands.py — the async body of every ipod-sync command.
+"""commands.py — async operations run by the ipod-sync TUI.
 
-Each function takes a `UI` (RichUI for one-shot subcommands, TextualUI inside
-the full-screen app) plus whatever else it needs, so the exact same code path
-runs from `ipod-sync <cmd>` and from the TUI's `:` command line.
+Each function takes a `UI` plus whatever else it needs, so the TUI can run the
+same code path from key bindings and dialogs.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 from . import APP_DIR, CACHE_DIR
-from . import apple_music, device, youtube as youtube_mod
+from . import apple_music, device
 from .apple_music import LibrarySong
 from .ipod_lib import IpodDatabase
 from .session import Session
@@ -21,7 +19,6 @@ from .sync import (
     FAVOURITES_PLAYLIST,
     RECENT_PLAYLIST,
     clean_staging,
-    find_orphans,
     plan_sync,
     prune_empty_dirs,
     read_audio_meta,
@@ -29,16 +26,7 @@ from .sync import (
 )
 from .ui import UI, console_for
 
-__all__ = ["add", "add_songs", "remove_track", "sync", "eject", "status", "clean_orphans", "login"]
-
-
-def _is_url(s: str) -> bool:
-    return s.startswith("http://") or s.startswith("https://")
-
-
-def _fmt_duration(ms: int) -> str:
-    total = ms // 1000
-    return f"{total // 60}:{total % 60:02d}"
+__all__ = ["add_songs", "remove_track", "sync", "eject"]
 
 
 def _find_ipod_path(db: IpodDatabase, track) -> str:
@@ -105,7 +93,7 @@ async def _download_songs(
     scan_cache: bool,
     jobs: int = 4,
 ) -> list[tuple[LibrarySong, Path]]:
-    """Shared retry-loop downloader used by both `add` and `sync`."""
+    """Shared retry-loop downloader used by add and sync flows."""
     if not songs:
         return []
     downloaded: list[tuple[LibrarySong, Path]] = []
@@ -168,164 +156,49 @@ async def _download_songs(
 # ── add ──────────────────────────────────────────────────────────────────────
 
 
-@dataclass
-class _AddPlan:
-    song: LibrarySong
-    local_path: Path | None = None
-    library_add: str | None = None  # "songs" or None
-
-
-async def _search_pick(ui: UI, session: Session, query: str) -> list[LibrarySong]:
-    async def fetch_page(page: int):
-        offset = page * 5
-        results = await apple_music.search_songs(session.api, query, limit=5, offset=offset)
-        return [
-            ((s.artist, s.title, s.album, _fmt_duration(s.duration_ms)), s)
-            for s in results
-        ]
-
-    return await ui.pick(f'"{query}"', ("Artist", "Title", "Album", "Duration"), fetch_page)
-
-
 def _dedupe_key(song: LibrarySong):
     return song.catalog_id or ("yt", track_key(song.artist, song.title))
 
 
 async def add_songs(ui: UI, session: Session, songs: Sequence[LibrarySong]) -> None:
     """Add already-resolved library songs straight to the iPod, skipping
-    query/URL resolution — used by the TUI's `a` search-and-add dialog."""
-    plans = {_dedupe_key(s): _AddPlan(s, library_add="songs") for s in songs}
-    await _commit_plans(ui, session, plans, set())
+    query resolution — used by the TUI's `a` search-and-add dialog."""
+    deduped = {_dedupe_key(s): s for s in songs}
+    await _commit_songs(ui, session, list(deduped.values()))
 
 
-async def add(
-    ui: UI,
-    session: Session,
-    args: Sequence[str],
-    yes: bool = False,
-    youtube: bool = False,
-) -> None:
-    """Add songs/albums/playlists to the iPod: a text search, an Apple Music
-    URL, or a YouTube URL. Never deletes or ejects."""
-    if not args:
-        ui.print("Usage: add <query|url>...")
-        return
-
-    plans: dict[object, _AddPlan] = {}
-    album_ids: set[str] = set()
-
-    def _add_plan(song: LibrarySong, *, local_path: Path | None = None, library_add: str | None = None):
-        key = _dedupe_key(song)
-        existing = plans.get(key)
-        if existing:
-            existing.local_path = existing.local_path or local_path
-            existing.library_add = existing.library_add or library_add
-        else:
-            plans[key] = _AddPlan(song, local_path, library_add)
-
-    for arg in args:
-        try:
-            if youtube_mod.is_playlist(arg):
-                ui.print(f"✗ {arg}: YouTube playlists are not supported")
-                continue
-
-            if youtube_mod.is_youtube_url(arg):
-                info = await youtube_mod.probe(arg)
-                if youtube:
-                    ui.print(
-                        f"{info.artist} — {info.title}  "
-                        f"({info.acodec} {info.abr:.0f} kbps → AAC 256 kbps)"
-                    )
-                    if not (yes or await ui.confirm("Download from YouTube?", default=True)):
-                        ui.print("skipped")
-                        continue
-                    dest_dir = CACHE_DIR / "YouTube"
-                    path = await youtube_mod.download(arg, dest_dir, info)
-                    song = LibrarySong("", info.artist, info.title, info.album)
-                    _add_plan(song, local_path=path, library_add=None)
-                else:
-                    query = f"{info.artist} {info.title}".strip()
-                    picked = await _search_pick(ui, session, query)
-                    for s in picked:
-                        _add_plan(s, library_add="songs")
-                continue
-
-            if _is_url(arg):
-                try:
-                    kind, songs, album_id = await apple_music.resolve_url(
-                        session.api, session.downloader, arg
-                    )
-                except ValueError as e:
-                    ui.print(f"✗ {arg}: {e}")
-                    continue
-                if kind == "song":
-                    for s in songs:
-                        _add_plan(s, library_add="songs")
-                elif kind == "album":
-                    for s in songs:
-                        _add_plan(s, library_add=None)
-                    if album_id:
-                        album_ids.add(album_id)
-                elif kind == "playlist":
-                    for s in songs:
-                        _add_plan(s, library_add=None)
-                continue
-
-            picked = await _search_pick(ui, session, arg)
-            for s in picked:
-                _add_plan(s, library_add="songs")
-        except Exception as e:
-            ui.print(f"✗ {arg}: {e}")
-
-    await _commit_plans(ui, session, plans, album_ids)
-
-
-async def _commit_plans(
-    ui: UI, session: Session, plans: dict[object, _AddPlan], album_ids: set[str]
-) -> None:
-    if not plans:
+async def _commit_songs(ui: UI, session: Session, songs: Sequence[LibrarySong]) -> None:
+    if not songs:
         ui.print("Nothing to add.")
         return
 
     with session.db() as db:
         ipod_keys = {track_key(t.artist, t.title) for t in db.tracks()}
-        wanted: list[_AddPlan] = []
-        for plan in plans.values():
-            song = plan.song
+        wanted: list[LibrarySong] = []
+        for song in songs:
             if session.aliases.key_for(song) in ipod_keys:
                 ui.song_line("=", song.artist, song.title, "already on iPod")
             else:
-                wanted.append(plan)
+                wanted.append(song)
 
         if not wanted:
             ui.print("Nothing new — everything is already on the iPod.")
             return
 
-        song_ids = sorted(
-            {p.song.catalog_id for p in wanted if p.library_add == "songs" and p.song.catalog_id}
-        )
+        song_ids = sorted({song.catalog_id for song in wanted if song.catalog_id})
         if song_ids:
             try:
                 await apple_music.add_to_library(session.api, song_ids, "songs")
             except Exception as e:
                 ui.print(f"[warning] could not add songs to library: {e}")
-        for aid in album_ids:
-            try:
-                await apple_music.add_to_library(session.api, [aid], "albums")
-            except Exception as e:
-                ui.print(f"[warning] could not add album {aid} to library: {e}")
 
-        to_download = [p.song for p in wanted if p.local_path is None]
-        downloaded = await _download_songs(ui, session, to_download, scan_cache=False)
+        downloaded = await _download_songs(ui, session, wanted, scan_cache=False)
         downloaded_map = {song: path for song, path in downloaded}
-        for p in wanted:
-            if p.local_path is None:
-                p.local_path = downloaded_map.get(p.song)
 
         recent_pl = db.ensure_playlist(RECENT_PLAYLIST)
         added_any = False
-        for p in wanted:
-            song, path = p.song, p.local_path
+        for song in wanted:
+            path = downloaded_map.get(song)
             if path is None:
                 continue  # download failed or never available; already reported
             try:
@@ -350,7 +223,7 @@ async def _commit_plans(
         prune_empty_dirs(session.mountpoint)
 
     if ui.mount_reminder:
-        ui.print("iPod left mounted — run `ipod-sync eject` when done.")
+        ui.print("iPod left mounted — use e when done.")
 
 
 async def remove_track(ui: UI, session: Session, ipod_path: str) -> None:
@@ -499,10 +372,10 @@ async def sync(
     if total_errors == 0:
         clean_staging()
     if ui.mount_reminder:
-        ui.print("iPod left mounted — run `ipod-sync eject` when done.")
+        ui.print("iPod left mounted — use e when done.")
 
 
-# ── eject / status / clean-orphans / login ──────────────────────────────────
+# ── eject ───────────────────────────────────────────────────────────────────
 
 
 async def eject(ui: UI, session: Session | None = None) -> bool:
@@ -522,48 +395,3 @@ async def eject(ui: UI, session: Session | None = None) -> bool:
     else:
         ui.print("Eject failed — unmount manually.")
     return ok
-
-
-async def status(ui: UI) -> None:
-    mountpoint = device.find_ipod_mount()
-    if not mountpoint:
-        ui.print("No iPod connected.")
-        return
-    dev = device.device_for_mount(mountpoint)
-    with IpodDatabase(mountpoint) as db:
-        tracks = db.tracks()
-        free_gb = db.free_bytes / 1e9
-        ui.print(
-            f'"{db.device_name}" at {mountpoint} ({dev or "?"}) — '
-            f"{len(tracks)} tracks, {free_gb:.1f} GB free"
-        )
-        names = [name for name, _pl in db.list_playlists()]
-    for name in names:
-        ui.print(f"  playlist: {name}")
-
-
-async def clean_orphans(ui: UI, session: Session | None = None, yes: bool = False) -> None:
-    mountpoint = session.mountpoint if session else device.find_ipod_mount()
-    if not mountpoint:
-        ui.print("No iPod connected.")
-        return
-    with IpodDatabase(mountpoint) as db:
-        orphans, orphan_bytes = find_orphans(db, mountpoint)
-    if not orphans:
-        ui.print("No orphaned files found.")
-        return
-    ui.print(f"{len(orphans)} orphaned files ({orphan_bytes / 1e9:.1f} GB)")
-    if not yes and not await ui.confirm("Delete these orphaned files?", default=False):
-        ui.print("Aborted — nothing changed.")
-        return
-    for f in orphans:
-        f.unlink(missing_ok=True)
-    prune_empty_dirs(mountpoint)
-    ui.print(f"Deleted {len(orphans)} orphaned files — freed {orphan_bytes / 1e9:.1f} GB")
-
-
-async def login(ui: UI) -> None:
-    from .auth import browser_login
-
-    browser_login(console_for(ui))
-    ui.print("Logged in.")

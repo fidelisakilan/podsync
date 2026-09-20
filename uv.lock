@@ -317,7 +317,6 @@ version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "cffi" },
-    { name = "click" },
     { name = "gamdl" },
     { name = "mutagen" },
     { name = "playwright" },
@@ -330,7 +329,6 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cffi", specifier = ">=2.0.0" },
-    { name = "click", specifier = ">=8.0" },
     { name = "gamdl", specifier = ">=2.9.3" },
     { name = "mutagen", specifier = ">=1.47.0" },
     { name = "playwright", specifier = ">=1.40" },

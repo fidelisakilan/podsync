@@ -1,18 +1,12 @@
-"""tui.py — full-screen Textual app: `ipod-sync` with no subcommand.
-
-Every `:` command line reuses the click commands defined in cli.py for
-argument parsing (`cmd.make_context`), then runs the matching commands.py
-coroutine as a worker so the UI stays responsive.
-"""
+"""tui.py — full-screen Textual app for `ipod-sync`."""
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import shlex
+import sys
 import time
 import threading
 
-import click
 from textual import work
 from textual.app import App, ComposeResult
 from rich.text import Text
@@ -23,17 +17,12 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Label, ListItem, ListView, LoadingIndicator, RichLog, Static
 
 from . import apple_music
-from . import cli as cli_module
 from . import device
 from .commands import (
-    add,
     add_songs,
-    clean_orphans,
     eject as eject_cmd,
-    login as login_cmd,
     remove_track,
     sync,
-    status as status_cmd,
 )
 from .session import Session, SessionError
 from .sync import FAVOURITES_PLAYLIST, RECENT_PLAYLIST, track_key
@@ -61,18 +50,6 @@ class CommandLoop:
     def stop(self) -> None:
         self.loop.call_soon_threadsafe(self.loop.stop)
 
-
-# Maps a click command name to the commands.py coroutine + how to build its
-# kwargs from the parsed click.Context.params.
-_COMMAND_MAP = {
-    "add": lambda ui, session, p: add(ui, session, list(p["query"]), yes=p["yes"], youtube=p["youtube"]),
-    "sync-add": lambda ui, session, p: sync(ui, session, hard=False, jobs=p["jobs"], yes=p["yes"]),
-    "sync-hard": lambda ui, session, p: sync(ui, session, hard=True, jobs=p["jobs"], yes=p["yes"]),
-    "eject": lambda ui, session, p: eject_cmd(ui, session),
-    "login": lambda ui, session, p: login_cmd(ui),
-    "status": lambda ui, session, p: status_cmd(ui),
-    "clean-orphans": lambda ui, session, p: clean_orphans(ui, session, yes=p["yes"]),
-}
 
 # Manually `add`ed tracks (as opposed to ones a sync brought in) are picked
 # out by colour instead of a dedicated column.
@@ -105,10 +82,6 @@ def _cell(text: str, width: int, added: bool) -> Text:
 def _fmt_duration(ms: int) -> str:
     total = ms // 1000
     return f"{total // 60}:{total % 60:02d}"
-
-
-# Commands that don't need an open Session (mount + Apple Music sign-in).
-_NO_SESSION_NEEDED = {"login", "status"}
 
 
 class StartupScreen(ModalScreen[None]):
@@ -435,10 +408,10 @@ class IpodSyncApp(App):
     /* .datatable--cursor and ListItem's highlighted state are left to
        Textual's own defaults: a real filled tile using the block-cursor
        tokens (ansi_magenta under ansi_color=True), not a hardcoded hex. */
-    #cmdline { background: transparent; border: none; padding: 0 1; }
-    #cmdline:focus { border: none; }
-    #cmdline { height: 1; border-top: solid $panel; }
-    #cmdline.-hidden { display: none; }
+    #filterline { background: transparent; border: none; padding: 0 1; }
+    #filterline:focus { border: none; }
+    #filterline { height: 1; border-top: solid $panel; }
+    #filterline.-hidden { display: none; }
 
     MountModal, LogModal, ConfirmModal, PickModal, StartupScreen, PlaylistChooser, AddSearchModal { align: center middle; }
     StartupScreen { background: transparent; }
@@ -463,7 +436,6 @@ class IpodSyncApp(App):
         Binding("G", "cursor_bottom", "Bottom", show=False),
         Binding("ctrl+f", "page_down", "PgDn", show=False),
         Binding("ctrl+b", "page_up", "PgUp", show=False),
-        Binding("colon", "open_cmdline", ":", show=True, key_display=":"),
         Binding("slash", "open_filter", "/", show=True, key_display="/"),
         Binding("a", "shortcut_add", "add", show=True),
         Binding("s", "shortcut_sync_add", "sync-add", show=True),
@@ -475,7 +447,7 @@ class IpodSyncApp(App):
         Binding("L", "toggle_log", "log", show=False),
         Binding("q", "request_quit", "quit", show=True),
         Binding("ctrl+c", "request_quit", "quit", show=False, priority=True),
-        Binding("escape", "close_cmdline", "close", show=False),
+        Binding("escape", "close_filter", "close", show=False),
     ]
 
     def __init__(self, **kwargs) -> None:
@@ -488,7 +460,6 @@ class IpodSyncApp(App):
         self._g_pressed = False
         self._log_lines: list[str] = []
         self._filter = ""
-        self._input_mode = "command"
         self._table_rows: list = []
         self._cmd = CommandLoop()
         self._activity: tuple[str, int, int] | None = None
@@ -504,7 +475,7 @@ class IpodSyncApp(App):
         yield Label("", id="header")
         yield DataTable(id="track-table", cursor_type="row")
         yield Static("", id="status-line", markup=True)
-        yield Input(placeholder="", id="cmdline", classes="-hidden")
+        yield Input(placeholder="", id="filterline", classes="-hidden")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -545,9 +516,7 @@ class IpodSyncApp(App):
 
     def _flash(self, text: str, seconds: float = 3.0) -> None:
         """Show `text` on the always-visible status line even when nothing
-        is "running" and the log pane is hidden — so a command that fails
-        before it even starts (bad syntax, unknown name, already busy) is
-        never silently visible only in the log."""
+        is "running" and the log pane is hidden."""
         self.query_one("#status-line", Static).update(text)
         if not self._activity:
             self.set_timer(
@@ -736,34 +705,33 @@ class IpodSyncApp(App):
         if hasattr(f, "action_page_up"):
             f.action_page_up()
 
-    # ── command line / filter ───────────────────────────────────────────────
-
-    def action_open_cmdline(self) -> None:
-        self._open_input("command", "")
+    # ── filter ──────────────────────────────────────────────────────────────
 
     def action_open_filter(self) -> None:
-        self._open_input("filter", self._filter)
-
-    def _open_input(self, mode: str, prefill: str) -> None:
-        self._input_mode = mode
-        inp = self.query_one("#cmdline", Input)
+        inp = self.query_one("#filterline", Input)
         inp.remove_class("-hidden")
-        inp.placeholder = ":command" if mode == "command" else "/filter"
-        inp.value = prefill
+        inp.placeholder = "/filter"
+        inp.value = self._filter
         inp.focus()
-        inp.cursor_position = len(prefill)
+        inp.cursor_position = len(self._filter)
 
-    def action_close_cmdline(self) -> None:
-        inp = self.query_one("#cmdline", Input)
+    def _hide_filter_input(self) -> None:
+        inp = self.query_one("#filterline", Input)
+        inp.add_class("-hidden")
+        inp.value = ""
+        self.query_one("#track-table", DataTable).focus()
+
+    def action_close_filter(self) -> None:
+        inp = self.query_one("#filterline", Input)
         if not inp.has_class("-hidden"):
-            mode = self._input_mode
-            inp.add_class("-hidden")
-            inp.value = ""
-            if mode == "filter" and self._filter:
-                # Escape while filtering clears the active filter, not just
-                # the in-progress edit.
+            self._hide_filter_input()
+            if self._filter:
                 self._filter = ""
                 self._load_table(self._current_playlist)
+            return
+        if self._filter:
+            self._filter = ""
+            self._load_table(self._current_playlist)
             self.query_one("#track-table", DataTable).focus()
             return
         if isinstance(self.focused, DataTable):
@@ -781,62 +749,12 @@ class IpodSyncApp(App):
         self.query_one("#track-table", DataTable).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "filterline":
+            return
         value = event.value
-        mode = self._input_mode
-        self.action_close_cmdline()
-        if mode == "filter":
-            self._filter = value.strip()
-            self._load_table(self._current_playlist)
-        else:
-            self._execute_line(value)
-
-    def _execute_line(self, line: str) -> None:
-        line = line.strip()
-        if not line or line in (":q", "q", "quit"):
-            if line:
-                self.action_request_quit()
-            return
-        try:
-            parts = shlex.split(line)
-        except ValueError as e:
-            self.log_line(f"[red]parse error: {e}[/red]")
-            self._flash(f"[red]✗ parse error: {e}[/red]")
-            return
-        if not parts:
-            return
-        name, args = parts[0], parts[1:]
-        if name == "help":
-            ctx = click.Context(cli_module.main, info_name="ipod-sync")
-            self.log_line(cli_module.main.get_help(ctx))
-            return
-        self._dispatch(name, args)
-
-    def _dispatch(self, name: str, args: list[str]) -> None:
-        cmd = cli_module.main.commands.get(name)
-        if cmd is None:
-            self.log_line(f"[red]unknown command: {name}[/red]")
-            self._flash(f"[red]✗ unknown command: {name}[/red]")
-            return
-        try:
-            ctx = cmd.make_context(name, list(args))
-        except click.UsageError as e:
-            self.log_line(f"[red]{e}[/red]")
-            self._flash(f"[red]✗ {e}[/red]")
-            return
-        handler = _COMMAND_MAP.get(name)
-        if handler is None:
-            self.log_line(f"[red]not available in the TUI: {name}[/red]")
-            self._flash(f"[red]✗ not available in the TUI: {name}[/red]")
-            return
-        if name not in _NO_SESSION_NEEDED and not self.session:
-            self.log_line("Not ready yet — still connecting.")
-            self._flash("[yellow]Not ready yet — still connecting.[/yellow]")
-            return
-        if self._current_future and not self._current_future.done():
-            self.log_line("[yellow]A command is still running — press x to cancel it first.[/yellow]")
-            self._flash("[yellow]A command is still running — press x to cancel it.[/yellow]")
-            return
-        self._launch_command(name, handler, ctx.params)
+        self._hide_filter_input()
+        self._filter = value.strip()
+        self._load_table(self._current_playlist)
 
     @work(exclusive=True)
     async def _launch_command(self, name: str, handler, params: dict) -> None:
@@ -897,13 +815,30 @@ class IpodSyncApp(App):
             )
 
     def action_shortcut_sync_add(self) -> None:
-        self._dispatch("sync-add", [])
+        self._run_tui_action(
+            "sync-add",
+            lambda ui, session, p: sync(ui, session, hard=False, jobs=4, yes=False),
+            {},
+        )
 
     def action_shortcut_sync_hard(self) -> None:
-        self._dispatch("sync-hard", [])
+        self._run_tui_action(
+            "sync-hard",
+            lambda ui, session, p: sync(ui, session, hard=True, jobs=4, yes=False),
+            {},
+        )
 
     def action_shortcut_eject(self) -> None:
-        self._dispatch("eject", [])
+        self._run_tui_action("eject", lambda ui, session, p: eject_cmd(ui, session), {})
+
+    def _run_tui_action(self, name: str, handler, params: dict) -> None:
+        if not self.session:
+            self._flash("[yellow]Not ready yet — still connecting.[/yellow]")
+            return
+        if self._current_future and not self._current_future.done():
+            self._flash("[yellow]A command is still running — press x to cancel it.[/yellow]")
+            return
+        self._launch_command(name, handler, params)
 
     def action_remove_track(self) -> None:
         f = self.focused
@@ -976,4 +911,10 @@ class IpodSyncApp(App):
 
 
 def run_tui() -> None:
+    if len(sys.argv) > 1:
+        print(
+            "ipod-sync only supports the TUI now. Run `ipod-sync`, then use the in-app keys.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     IpodSyncApp(ansi_color=True).run()

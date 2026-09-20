@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rich.console import Console
-from rich.prompt import Prompt
-from rich.table import Table
 
 
 def find_ipod_mount() -> str | None:
@@ -114,60 +112,3 @@ def eject(dev: str, console: Console) -> bool:
         console.print(f"[yellow]Power-off failed: {out.stderr.strip()}[/yellow]")
         return False
     return True
-
-
-def prompt_and_mount(console: Console) -> str | None:
-    while True:
-        mountpoint = find_ipod_mount()
-        if mountpoint:
-            if is_read_only(mountpoint):
-                print_read_only_hint(mountpoint, console)
-                return None
-            return mountpoint
-
-        candidates = list_candidates()
-        if not candidates:
-            console.print("No iPod mounted and no unmounted USB partitions found.")
-            choice = Prompt.ask(
-                "Connect your iPod, then \\[r]escan or \\[q]uit",
-                choices=["r", "q"],
-                default="r",
-            )
-            if choice == "q":
-                return None
-            continue
-
-        table = Table(title="Unmounted USB partitions")
-        table.add_column("#")
-        table.add_column("Device")
-        table.add_column("Label")
-        table.add_column("Size")
-        table.add_column("FS")
-        for i, c in enumerate(candidates, 1):
-            table.add_row(str(i), c.path, c.label, c.size_gb, c.fstype)
-        console.print(table)
-
-        choices = [str(i) for i in range(1, len(candidates) + 1)] + ["r", "q"]
-        choice = Prompt.ask(
-            "Mount which device? (\\[r]escan / \\[q]uit)", choices=choices, default="1"
-        )
-        if choice == "q":
-            return None
-        if choice == "r":
-            continue
-
-        dev = candidates[int(choice) - 1].path
-        try:
-            mountpoint = mount(dev)
-        except RuntimeError as e:
-            console.print(f"[red]Mount failed: {e}[/red]")
-            continue
-        if (Path(mountpoint) / "iPod_Control").exists():
-            if is_read_only(mountpoint):
-                print_read_only_hint(mountpoint, console)
-                return None
-            console.print(f"Mounted {dev} at {mountpoint}")
-            return mountpoint
-        console.print(
-            f"[yellow]{dev} mounted at {mountpoint} but has no iPod_Control/ — not an iPod.[/yellow]"
-        )

@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "gamdl>=2.9.3",
-    "click>=8.0",
     "rich>=13.0",
     "cffi>=2.0.0",
     "mutagen>=1.47.0",
@@ -17,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ipod-sync = "ipod_sync.cli:main"
+ipod-sync = "ipod_sync.tui:run_tui"
 
 [build-system]
 requires = ["hatchling"]
