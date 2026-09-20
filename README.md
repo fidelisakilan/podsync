@@ -32,9 +32,10 @@ uv run ipod-sync
 ```
 
 Opens the iPod, signs in, and shows a full-width table of the **iPod's
-actual contents** (not the Apple Music library — that's instant). Manually
-`add`ed tracks (as opposed to ones a sync brought in, see below) are shown in
-cyan instead of a separate column.
+actual contents** (not the Apple Music library — that's instant), with
+Artist / Album / Song columns, sorted by artist, then album, then song
+title. Manually `add`ed tracks (as opposed to ones a sync brought in, see
+below) are shown in cyan.
 
 Keys:
 
@@ -44,14 +45,15 @@ Keys:
 | `gg` / `G` | jump to top / bottom |
 | `Ctrl-f` / `Ctrl-b` | page down / up |
 | `Esc` | open a floating chooser for the playlist to view (All tracks / Favourites / Recently Added / …) — `j`/`k` and `Enter` to pick, `Esc` to cancel |
-| `/` | filter the track table |
+| `/` | filter the track table — `Esc` while filtering clears it and goes back to the full list |
 | `:` | open the command line (`shlex`-split, same commands as the CLI) |
-| `a` | opens `:add ` for you to type a query or URL |
+| `a` | opens a search dialog: type a query, `Enter` to search, `j`/`k` (or the arrow keys) to browse results — more load automatically as you near the bottom — `Enter` on a result to add that song. `Esc` first clears the box back to a fresh search, `Esc` again cancels. The log opens automatically so you can watch it download, and closes itself when the run is clean — it stays open if anything failed, so the error doesn't vanish before you can read it |
 | `s` / `S` | run `sync-add` / `sync-hard` |
 | `e` | eject |
+| `d` | remove the highlighted track from the iPod (confirms first) — never touches your Apple Music library |
 | `x` | cancel the running command |
-| `` ` `` | toggle the log pane (hidden by default; the status line shows the current activity, count and elapsed time) |
-| `q` or `:q` | quit — asks "Eject iPod?" (default yes) |
+| `` ` `` | open the log in a dialog (`Esc`/`q` to close; the status line shows the current activity, count and elapsed time) |
+| `q` or `:q` | quit — asks "Eject iPod?" (default no) |
 
 Every `:` command below also works one-shot from zsh.
 
@@ -77,11 +79,14 @@ when you're done (syncs no longer auto-eject).
 
 ### `add`
 
-Takes one or more text queries or URLs:
+In the TUI, `a` opens a dedicated search dialog (see the key table above) for
+the common case: type a song query, `Enter` on a result adds it. `:add` and
+the one-shot `ipod-sync add` subcommand instead take one or more text queries
+or URLs:
 
-- **Text** → a paged pick list (5 at a time, multi-select, `n`/`p` to page).
-  The chosen songs are added to your Apple Music library, downloaded, and
-  copied to the iPod.
+- **Text** → a paged pick list (5 at a time, multi-select with `Space`,
+  `Enter` confirms the selection, `n`/`p` to page). The chosen songs are
+  added to your Apple Music library, downloaded, and copied to the iPod.
 - **Apple Music song URL** → added to your library directly, no picker.
 - **Apple Music album URL** → the whole album is added to your library and
   pushed to the iPod.

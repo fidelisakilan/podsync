@@ -72,6 +72,11 @@ class UI(Protocol):
 class RichUI:
     """One-shot zsh-subcommand UI: plain Rich output, blocking prompts."""
 
+    # A one-shot command has no "quit" to hook an eject prompt onto (unlike
+    # the TUI, which always offers to eject on quit), so it still needs the
+    # "left mounted" reminder after add/sync.
+    mount_reminder = True
+
     def __init__(self, console: Console | None = None, yes: bool = False):
         self.console = console or Console()
         self.yes = yes
@@ -309,6 +314,10 @@ class TextualUI:
     `app` must implement `log_line(text)` and `set_progress(desc, done, total)`
     (see tui.IpodSyncApp).
     """
+
+    # The TUI already has a first-class eject flow (`e`/`:eject`, plus a
+    # prompt on quit), so the one-shot-CLI "left mounted" reminder is noise.
+    mount_reminder = False
 
     def __init__(self, app):
         self.app = app

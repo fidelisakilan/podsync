@@ -29,7 +29,7 @@ from .sync import (
 )
 from .ui import UI, console_for
 
-__all__ = ["add", "sync", "eject", "status", "clean_orphans", "login"]
+__all__ = ["add", "add_songs", "remove_track", "sync", "eject", "status", "clean_orphans", "login"]
 
 
 def _is_url(s: str) -> bool:
@@ -187,6 +187,17 @@ async def _search_pick(ui: UI, session: Session, query: str) -> list[LibrarySong
     return await ui.pick(f'"{query}"', ("Artist", "Title", "Album", "Duration"), fetch_page)
 
 
+def _dedupe_key(song: LibrarySong):
+    return song.catalog_id or ("yt", track_key(song.artist, song.title))
+
+
+async def add_songs(ui: UI, session: Session, songs: Sequence[LibrarySong]) -> None:
+    """Add already-resolved library songs straight to the iPod, skipping
+    query/URL resolution — used by the TUI's `a` search-and-add dialog."""
+    plans = {_dedupe_key(s): _AddPlan(s, library_add="songs") for s in songs}
+    await _commit_plans(ui, session, plans, set())
+
+
 async def add(
     ui: UI,
     session: Session,
@@ -202,9 +213,6 @@ async def add(
 
     plans: dict[object, _AddPlan] = {}
     album_ids: set[str] = set()
-
-    def _dedupe_key(song: LibrarySong):
-        return song.catalog_id or ("yt", track_key(song.artist, song.title))
 
     def _add_plan(song: LibrarySong, *, local_path: Path | None = None, library_add: str | None = None):
         key = _dedupe_key(song)
@@ -269,6 +277,12 @@ async def add(
         except Exception as e:
             ui.print(f"✗ {arg}: {e}")
 
+    await _commit_plans(ui, session, plans, album_ids)
+
+
+async def _commit_plans(
+    ui: UI, session: Session, plans: dict[object, _AddPlan], album_ids: set[str]
+) -> None:
     if not plans:
         ui.print("Nothing to add.")
         return
@@ -335,7 +349,25 @@ async def add(
             session.origins.save()
         prune_empty_dirs(session.mountpoint)
 
-    ui.print("iPod left mounted — run `ipod-sync eject` when done.")
+    if ui.mount_reminder:
+        ui.print("iPod left mounted — run `ipod-sync eject` when done.")
+
+
+async def remove_track(ui: UI, session: Session, ipod_path: str) -> None:
+    """Remove one track from the iPod (file + iTunesDB entry). Never touches
+    the Apple Music library — used by the TUI's song-column `d` key."""
+    with session.db() as db:
+        match = next((t for t in db.tracks() if t.ipod_path == ipod_path), None)
+        if match is None:
+            ui.print("✗ track no longer on the iPod")
+            return
+        db.remove_track(match.ptr)
+        session.origins.drop(match.ipod_path)
+        db.fix_playlist_links()
+        db.save()
+    session.origins.save()
+    prune_empty_dirs(session.mountpoint)
+    ui.song_line("✓", match.artist, match.title, "removed from iPod")
 
 
 # ── sync (sync-add / sync-hard) ─────────────────────────────────────────────
@@ -466,7 +498,8 @@ async def sync(
     )
     if total_errors == 0:
         clean_staging()
-    ui.print("iPod left mounted — run `ipod-sync eject` when done.")
+    if ui.mount_reminder:
+        ui.print("iPod left mounted — run `ipod-sync eject` when done.")
 
 
 # ── eject / status / clean-orphans / login ──────────────────────────────────
