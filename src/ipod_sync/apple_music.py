@@ -27,7 +27,7 @@ async def _patched_get_token(self) -> str:
     home_page = response.text
 
     index_js_uri_match = re.search(
-        r"/(assets/index-legacy[~-][^/\"]+\.js)",
+        r"/(assets/index(?:-legacy)?[~-][^/\"]+\.js)",
         home_page,
     )
     if not index_js_uri_match:
